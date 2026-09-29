@@ -1,0 +1,31 @@
+# This file was generated using idf.py save-defconfig. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) 5.5.1 Project Minimal Configuration
+#
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=512
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FREERTOS_HZ=1000
+
+# ---------- 网络推流(电脑 -> ESP32 音频)----------
+# TCP 接收窗口默认只有 5760 字节,撑 48k/2ch/16bit 需要的 192KB/s
+# 要求往返延迟 <= 30ms。拉到 16KB,留出 85ms 余量。
+# 不能拉太大:BLE 和 WiFi 共用射频(coex),射频被 BLE 占走时数据会在
+# 缓冲区里堆积,在途数据越多越容易把缓冲池撑爆、连接被 lwIP 复位。
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+# 接收邮箱默认只有 6 个段深,会拖住窗口填满的速度
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+# 动态接收缓冲按需分配,把上限抬高只是多留余量,平时不占内存
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+
+# ---------- 蓝牙(BLE 控制)----------
+# S3 没有经典蓝牙,所以选 NimBLE(BLE 专用,比 Bluedroid 省内存)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+# 主机堆放到 PSRAM:内部 DRAM 留着给 LVGL 替代品和任务栈
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y

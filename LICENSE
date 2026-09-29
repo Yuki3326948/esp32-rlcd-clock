@@ -1,0 +1,33 @@
+MIT License
+
+Copyright (c) 2026 Yuki3326948
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------
+
+注意:本许可证只覆盖本仓库中的原创代码(firmware/components 下除 u8g2 之外的
+组件、pc-tools、docs)。仓库里还包含第三方代码,它们各自遵循自己的许可证:
+
+  firmware/components/u8g2/        u8g2,BSD 2-Clause,见该目录下的 LICENSE
+  firmware/components/port_bsp/    ST7305 初始化序列参考 Waveshare 官方示例
+  espressif/esp-dsp                构建时从 ESP 组件注册表自动下载
+  espressif/esp_codec_dev          同上
+
+详见 README.md 的「第三方代码与致谢」一节。

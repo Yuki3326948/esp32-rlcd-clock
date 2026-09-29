@@ -1,0 +1,20 @@
+# 统一换行符处理。
+#
+# 这个项目主要在 Windows 上开发,但源码要在 Linux/macOS 上也能正常编译。
+# 仓库里一律存 LF,检出到工作区时由 Git 按平台自动转换 —— 这样不同系统
+# 的贡献者不会因为 CRLF/LF 差异产生满屏的假改动。
+* text=auto
+
+# 明确标成二进制,别让 Git 去动它们的换行符
+*.bin       binary
+*.png       binary
+*.jpg       binary
+*.pdf       binary
+*.wav       binary
+*.pcm       binary
+*.zst       binary
+
+# 上面是"什么",下面是"怎么显示"——保住 diff 的可读性
+*.c    diff=c
+*.h    diff=c
+*.cpp  diff=cpp

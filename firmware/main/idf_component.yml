@@ -1,0 +1,21 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  idf:
+    version: '>=4.1.0'
+  # # Put list of dependencies here
+  # # For components maintained by Espressif:
+  # component: "~1.0.0"
+  # # For 3rd party components:
+  # username/component: ">=1.0.0,<2.0.0"
+  # username2/component2:
+  #   version: "~1.0.0"
+  #   # For transient dependencies `public` flag can be set.
+  #   # `public` flag doesn't have an effect dependencies of the `main` component.
+  #   # All dependencies of `main` are public by default.
+  #   public: true
+  # LVGL 已拆除:界面是固定布局的单色屏,LVGL 的对象树/脏区/样式
+  # 在这里纯属负担(实测占 429KB flash + 65KB 内部 DRAM)。
+  # 现在用自写的 components/ui_draw 直接往显存里画。
+  espressif/esp_codec_dev: ^1.4.0
+  espressif/esp-dsp: '*'
