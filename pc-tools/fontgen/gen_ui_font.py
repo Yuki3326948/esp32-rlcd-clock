@@ -13,14 +13,16 @@
   3. 每个字号只带真正用到的字符,不带 cmap / kerning 那些表
 
 用法: python gen_ui_font.py
-输出: components/ui_fonts/ui_font_data.c
+输出: firmware/components/ui_draw/ui_font_data.c
 """
 import os
 
 from PIL import ImageFont
 
-PROJ = r"L:\ESP32\projects\ESP32-S3-RLCD-4.2\02_Example\ESP-IDF\11_U8G2_Test"
-OUT = os.path.join(PROJ, "components", "ui_draw", "ui_font_data.c")
+# 脚本在 pc-tools/fontgen/ 下,仓库根目录就是往上三级。
+# ★ 不要写死本机绝对路径 —— 别人 clone 到哪儿都得能跑。
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+OUT  = os.path.join(ROOT, "firmware", "components", "ui_draw", "ui_font_data.c")
 
 # 中文用【微软雅黑】:笔画末端和转折都是圆的,比黑体(SimHei)的方头笔锋圆润得多。
 # 关键是总笔画量差不多(实测 16px 下雅黑 302 像素 / 黑体 288),所以只是形状变圆,
@@ -64,6 +66,7 @@ CJK_SAMPLES = [
     "未知",                      # 电池电源类型(实际只进日志,顺手带上)
     "松手定",                    # 按键提示里的"长按换源(松手定)"
     "本地",                      # 中间那行:频谱来源="来自本地"
+    "等电脑端连过来",            # 源选在"电脑推流"但电脑还没连上时的状态字
 ]
 CJK = "".join(dict.fromkeys("".join(CJK_SAMPLES)))
 print(f"共用 {len(CJK)} 个汉字")

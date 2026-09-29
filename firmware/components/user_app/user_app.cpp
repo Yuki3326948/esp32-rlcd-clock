@@ -1217,7 +1217,12 @@ static void SpectrumTask(void *arg)
             if (s_spec_src == SRC_MIC) {
                 st = "麦克风频谱";
             } else if (s_spec_src == SRC_STREAM) {
-                st = NetAudio_IsPaused() ? "推流暂停" : "电脑推流";
+                /* "等电脑连接"这一档很重要:源选在"电脑推流"但电脑端程序
+                   没开(或者刚被"停止推流"关掉)时,屏幕必须把"在等"说清楚。
+                   不然就是"选了电脑推流却一片安静",只能靠猜 ——
+                   用户的第一反应会是"固件坏了"。 */
+                st = !NetAudio_IsConnected() ? "等电脑连接" :
+                     NetAudio_IsPaused()     ? "推流暂停"   : "电脑推流";
             } else {
                 st = s_music_playing ? "播放中" : "已暂停";
             }
@@ -1258,6 +1263,15 @@ static void MusicStep(int delta)
              s_track + 1, s_track_cnt);
 }
 
+/* 板子现在想不想要电脑的声音?net_audio 建连时会问一句。
+   答案就是用户选的频谱源 —— 只有"电脑推流"才要。
+   这样电脑一开始推流不会把正在放的 TF 卡音乐顶掉,
+   而是安静地等着,用户切到"电脑推流"那一刻立刻有声。 */
+static bool WantPcAudio(void)
+{
+    return s_spec_src == SRC_STREAM;
+}
+
 /* 切换频谱来源。集中在一处改:除了 s_spec_src 自己,还要通知推流任务
    "现在轮到你喂频谱了吗" —— 三个来源同时往同一个 FFT 里灌数据的话,
    柱子会是三者的混合物,谁也看不准。 */
@@ -1268,6 +1282,47 @@ static void SetSpecSource(int src)
     ESP_LOGI(TAG, "频谱源 -> %s(松手定在这里)",
              s_spec_src == SRC_MIC    ? "麦克风" :
              s_spec_src == SRC_STREAM ? "电脑推流" : "播放音乐");
+}
+
+/* 松手"定在这里"之后的收尾:把播放通道要回来。
+ *
+ * ★ 为什么必须有这一步:
+ *   三个声源同时只能有一个在出声,但"选源"以前【只改了频谱显示来源】,
+ *   没管播放通道 —— 电脑一推流就一直占着 DAC。于是用户看着屏幕上写着
+ *   "频谱源 -> 播放音乐",按 BOOT 却什么都不动(那一下被当成"暂停推流"了),
+ *   而且看日志也看不出问题。
+ *
+ * ★ 为什么放在【松手】而不是切源那一刻:
+ *   长按轮换会一路经过三个源。要是每经过一个就把推流断一次,
+ *   wascap 会不停重连,体验很差。只有最终停在哪个才算数。
+ *
+ * 停在"电脑推流"上就什么都不做 —— 通道本来就该是它的。
+ * (发 STOP 后 wascap 是【干净退出】的,不会自己重连,所以通道能稳定交还。) */
+static void CommitSpecSource(void)
+{
+    /* 停在"电脑推流"上:把喇叭要回来。
+       连接一直留着(wascap 从头到尾没退出过),所以这里【立刻】有声,
+       不需要用户重新双击电脑上那个 exe。 */
+    if (s_spec_src == SRC_STREAM) {
+        if (NetAudio_SetYield(false)) {
+            ESP_LOGI(TAG, "定在电脑推流,准备收回喇叭");
+        }
+        return;
+    }
+
+    /* 停在别的源上:让出喇叭,但【不发 STOP】。
+     *
+     * ★ 这里以前发的是 STOP,而 wascap 收到 STOP 是"干净退出"的。
+     *   于是用户切回"电脑推流"时电脑端程序早就没了 —— 屏幕上写着"电脑推流",
+     *   耳朵里一点声音都没有,还得自己想起来重新双击那个 exe 才行。
+     *   现象看起来像"固件坏了",实际上只是两边对"停止"的理解不一致。
+     *
+     *   现在只"让出":连接和接收都保留,wascap 一直活着,切回来立刻有声。
+     *   真要关掉电脑端程序是 KEY 长按("停止推流"),那是用户的明确意思。 */
+    if (NetAudio_SetYield(true)) {
+        ESP_LOGI(TAG, "定在 %s,已让电脑让出喇叭(它不用重开)",
+                 s_spec_src == SRC_MIC ? "麦克风" : "播放音乐");
+    }
 }
 
 #define KEY_LONG_TICKS   80     /* 80 x 10ms = 800ms 算长按 */
@@ -1310,7 +1365,12 @@ static void ButtonTask(void *arg)
                        为何放 KEY 上:推流时 TF 卡已经让出播放通道,
                        "下一首"本来就无意义,正好空着;而停止推流是不可逆的,
                        不该跟"轮换频谱源"抢同一个键。 */
-                    if (NetAudio_IsStreaming()) {
+                    /* 只有停在"电脑推流"上,KEY 长按才是"停止推流"。
+                       别的源上它去干本页的活(下一首 / 12-24 小时制 / 刷新),
+                       免得"切源"和"停推流"又抢同一个动作。
+                       注意判断用的是 IsConnected 而不是 IsStreaming:
+                       喇叭让出去之后连接还在,用户仍然应该能把电脑端程序关掉。 */
+                    if (s_spec_src == SRC_STREAM && NetAudio_IsConnected()) {
                         if (NetAudio_RequestStop()) {
                             ESP_LOGI(TAG, "已通知电脑停止推流");
                         }
@@ -1396,6 +1456,11 @@ static void ButtonTask(void *arg)
                     s_music_playing = !s_music_playing;
                     ESP_LOGI(TAG, "%s音乐", s_music_playing ? "继续播放" : "暂停");
                 }
+            } else {
+                /* 长按松手:源已经定下来了,收尾 ——
+                   如果定的不是"电脑推流",就把播放通道从电脑手里要回来,
+                   否则按 BOOT 根本放不了本地音乐(通道还在电脑那儿)。 */
+                CommitSpecSource();
             }
         }
 
@@ -1452,13 +1517,32 @@ static void MusicTask(void *arg)
             continue;
         }
 
-        /* 切到麦克风频谱时也必须停播放:
-           否则喇叭的声音会被自己的麦克风收进去,变成回授。
-           电脑在推流时同理 —— I2S 已经被 net_audio 占着,得让出来。 */
-        if (!s_music_playing || s_spec_src == SRC_MIC ||
+        /* ★ 本地音乐【只在"播放音乐"这个源下】才放。
+           以前这里只挡了麦克风和推流:
+               !s_music_playing || s_spec_src == SRC_MIC || NetAudio_IsStreaming()
+           于是"切到电脑推流、但电脑还没连上"时三条全不成立,TF 卡继续响 ——
+           屏幕上的源写着"电脑推流",耳朵里却是本地音乐,谁都看不明白。
+
+           改成只认一个正条件,规则就一句话:**源就是你听到的声音**。
+             源 = 播放音乐 + 电脑没占着喇叭  -> 放 TF 卡
+             源 = 麦克风 / 电脑推流          -> 静音(哪怕电脑还没连上也一样)
+             电脑占着喇叭                    -> 让位(它的 DAC 不能和播放抢)
+           麦克风那条还多一层原因:喇叭的声音会被自己的麦克风收进去,变成回授。
+
+           注意 NetAudio_IsStreaming() 问的是"电脑【占着喇叭】吗",
+           而不是"电脑连着吗" —— 让出通道期间连接还在,但它返回 false,
+           喇叭就该还给 TF 卡(见 net_audio.c 里 s_yield 的说明)。 */
+        if (!s_music_playing || s_spec_src != SRC_PLAYBACK ||
             NetAudio_IsStreaming()) {
             if (playing) {
-                Audio_Mute(true);          /* 暂停 = 把 DAC 静音 */
+                /* ⚠️ 因为"电脑占着喇叭"而停的这一次,【不能 mute DAC】:
+                   DAC 此时归 net_audio 管 —— 它拿走通道时刚 unmute 过,
+                   我们后手再 mute 一下就静音了,而且它不会再 unmute,
+                   现象是"电脑接上了但没声音",查起来完全想不到是播放任务干的。
+                   net_audio 断开或让出时自己会静音,不需要我们代劳。 */
+                if (!NetAudio_IsStreaming()) {
+                    Audio_Mute(true);      /* 暂停 = 把 DAC 静音 */
+                }
                 Spectrum_Enable(false);    /* 柱子归零 */
                 playing = false;
             }
@@ -2211,7 +2295,11 @@ static void RenderMusicPage(void)
     DrawText(200, 257 + ui_font_cjk16.base, &ui_font_cjk16,
              NetAudio_IsStreaming()
                  ? "BOOT 暂停/继续  长按换源\nKEY 切页  长按停止推流"
-                 : "BOOT 播放/暂停  长按换源(松手定)\nKEY 切页  长按下一首  双击上一首",
+                 : (s_spec_src == SRC_STREAM)
+                     /* 停在"电脑推流"但电脑还没连上来:别提示"长按停止推流",
+                        那会儿根本没东西可停 —— 直接告诉用户去开电脑端程序 */
+                     ? "源在电脑推流,等电脑端连过来\nBOOT 长按换源  KEY 切页"
+                     : "BOOT 播放/暂停  长按换源(松手定)\nKEY 切页  长按下一首  双击上一首",
              0, true);
 }
 
@@ -2935,6 +3023,7 @@ void UserApp_TaskInit(void)
     }
 
     /* 网络音频:等电脑连过来推流(tools/stream_audio.py) */
+    NetAudio_SetWantCallback(WantPcAudio);   /* 先注册,再起任务 */
     NetAudio_Start();
     Sysmon_Start();          /* PC 资源遥测:监听 3334 */
 

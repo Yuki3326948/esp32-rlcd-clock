@@ -20,12 +20,13 @@ import os
 import re
 import sys
 
-PROJ = r"L:\ESP32\projects\ESP32-S3-RLCD-4.2\02_Example\ESP-IDF\11_U8G2_Test"
-GEN = r"L:\ESP32\tools\fontgen\gen_ui_font.py"
+# 脚本在 pc-tools/fontgen/ 下,仓库根目录就是往上三级。
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+GEN  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen_ui_font.py")
 
 SOURCES = [
-    os.path.join(PROJ, "components", "user_app", "user_app.cpp"),
-    os.path.join(PROJ, "components", "ui_draw", "ui_draw.cpp"),
+    os.path.join(ROOT, "firmware", "components", "user_app", "user_app.cpp"),
+    os.path.join(ROOT, "firmware", "components", "ui_draw", "ui_draw.cpp"),
 ]
 
 
