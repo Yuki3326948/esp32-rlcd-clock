@@ -7,6 +7,7 @@
 #include "display_bsp.h"
 #include "user_app.h"
 #include "user_config.h"
+#include "usb_test.h"
 #include "u8g2_st7305.h"
 
 #if !APP_USE_U8G2_DEMO
@@ -140,5 +141,11 @@ extern "C" void app_main(void)
 	RlcdPort.RLCD_Init();
 	UserApp_UiInit();      /* 建显存锁 + 画首页 */
 	UserApp_TaskInit();
+
+/* 临时:Type-C(USB-Serial-JTAG)当数据口的实测。测完改成 0。 */
+#define USB_TEST 0
+#if USB_TEST
+	UsbTest_Start();
+#endif
 #endif
 }

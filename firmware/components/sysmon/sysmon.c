@@ -14,6 +14,7 @@
 #include <dirent.h>
 
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -35,6 +36,35 @@ static volatile bool s_connected = false;
 static char          s_peer[20]  = "";
 static SysStatus_t   s_st;
 
+/* ---------------- 路由器(WAN)那一份,走 3335 ----------------
+   和 PC 的 3334 完全独立:板子的 3334 是单客户端设计(accept 之后就
+   死循环 read),而 PC 上的 temp_widget 是长连接常占着它 ——
+   两条流必须分端口。
+   ★ 路由器那边是"每秒一条、发完就关"的短连接,所以这里**不能**用
+     "TCP 是否连着"当有效判据(连接开着的时间只占几个毫秒)。
+     唯一算数的就是 s_rt_last_us:最后一次真收到数据的时间。 */
+static char    s_rt_peer[20] = "";
+static int64_t s_rt_last_us  = 0;     /* 最后一次收到数据的时间 */
+
+/* 板子重启 / 路由器挂了 / 网线掉了 —— 都表现为"很久没数据"。
+   10 秒收不到东西就当断开,免得屏上挂着不动。 */
+#define RT_STALE_US  (10 * 1000 * 1000)
+
+/* 路由器是"每秒一条、发完就关"的短连接。每次连接都记日志会把串口刷爆
+   (一天 17 万行),所以只在"确实断了一阵子又回来"时才记一笔。 */
+#define RT_LOUD_US   (30 * 1000 * 1000)
+
+/* 路由器数据算不算新鲜。
+   ★★ 只看"最近有没有收到数据",**绝不能看 TCP 是否正连着** ★★
+   短连接的连接只活几个毫秒,拿它当判据的话屏上几乎永远是 "--"、
+   历史曲线也全是 0。(这个坑踩过:数据明明一直在每秒到达,屏上却什么都不显示。)
+   TCP 连着但数据不来了(拔线 / 路由器挂了)也走这条超时,一样会变成 "--"。 */
+static bool rt_fresh(void)
+{
+    return s_rt_last_us &&
+           (esp_timer_get_time() - s_rt_last_us) < RT_STALE_US;
+}
+
 /* 实测采样间隔,用来把"点数"换算成"时间跨度"给横轴用 */
 static int64_t s_last_us;
 static int     s_interval_ms;
@@ -42,7 +72,7 @@ static int     s_interval_ms;
 /* ============================================================
  *  TF 卡日志
  * ============================================================
- *  为什么存卡:PSRAM 里的环形缓冲只有 3 小时,存卡能长期保留,
+ *  为什么存卡:PSRAM 里的环形缓冲只有 78 秒,存卡能长期保留,
  *  而且拔卡插电脑就能直接分析。
  *
  *  写入策略(对卡友好):先在内存攒着,写满接近 2KB 或者超过 30 秒
@@ -57,7 +87,7 @@ static int     s_interval_ms;
 #define LOG_BUF_SIZE   2048
 #define LOG_FLUSH_MS   30000
 
-static char    s_log_buf[LOG_BUF_SIZE];
+EXT_RAM_BSS_ATTR static char s_log_buf[LOG_BUF_SIZE];
 static int     s_log_len;
 static FILE   *s_log_f;
 static char    s_log_path[96];       /* 当前日志文件全路径 */
@@ -348,6 +378,26 @@ static void parse_line(char *line)
         else if (!strcmp(key, "VRAMT")) s_st.vram_total = (unsigned)atoi(v);
         else if (!strcmp(key, "NETRX")) s_st.down_kbps = (unsigned)atoi(v);
         else if (!strcmp(key, "NETTX")) s_st.up_kbps   = (unsigned)atoi(v);
+        /* 路由器那条流(3335)。总量单位是 MiB 不是字节 ——
+           字节数 32 位放不下(5TB 就溢出),atoi 会直接给出个假数 */
+        else if (!strcmp(key, "RTDN"))  s_st.rt_dn_mib  = (unsigned)atoi(v);
+        else if (!strcmp(key, "RTUP"))  s_st.rt_up_mib  = (unsigned)atoi(v);
+        else if (!strcmp(key, "RTDS"))  s_st.rt_ds_kbps = (unsigned)atoi(v);
+        else if (!strcmp(key, "RTUS"))  s_st.rt_us_kbps = (unsigned)atoi(v);
+        /* 天气。和上面的路由器流量走同一条流,值 10 分钟才变一次。
+           wx_ok 只在【真收到过】之后才置位 —— 界面那边靠它 + rt_ok
+           判新鲜度,所以路由器没推的时候不会把初值 0 当成"0°C"显示。
+           只在变化时记一行日志:10 分钟才变一次,不会刷屏,
+           而且是排查"天气没出来"时唯一能看的东西。 */
+        else if (!strcmp(key, "OTEMP")) {
+            int t = atoi(v);
+            if (!s_st.wx_ok || t != s_st.out_temp) {
+                ESP_LOGI(TAG, "室外 %d°C  WMO=%d", t, s_st.wmo_code);
+            }
+            s_st.out_temp = t;
+            s_st.wx_ok    = true;
+        }
+        else if (!strcmp(key, "OWMO"))  s_st.wmo_code = atoi(v);
 
         *end = save;
         p    = end;
@@ -383,8 +433,13 @@ static void record_sample(void)
     d->ram  = (uint8_t)(s_st.ram  < 0 ? 0 : (s_st.ram  > 100 ? 100 : s_st.ram));
     d->cput = (uint8_t)(s_st.cput < 0 ? 0 : (s_st.cput > 120 ? 120 : s_st.cput));
     d->gput = (uint8_t)(s_st.gput < 0 ? 0 : (s_st.gput > 120 ? 120 : s_st.gput));
-    d->down = s_st.down_kbps;
-    d->up   = s_st.up_kbps;
+    /* 历史记的是【路由器】WAN 的速率,不是 PC 网卡的 ——
+       主页面那两根 ↓/↑ 柱现在显示路由器数据,曲线页必须同源,
+       否则同一个概念在两个页面上是两个数。
+       PC 不在、只有路由器在推时这一条流也不采样(ring 的节拍由
+       PC 的 0.5 秒定义),那种情况下曲线是空的但柱子照常工作。 */
+    d->down = rt_fresh() ? s_st.rt_ds_kbps : 0;
+    d->up   = rt_fresh() ? s_st.rt_us_kbps : 0;
 
     s_head = (s_head + 1) % s_cap;
     if (s_count < s_cap) {
@@ -483,6 +538,101 @@ static void SysmonTask(void *arg)
 }
 
 /* ============================================================
+ *  路由器任务:监听 3335,收路由器推来的 WAN 流量
+ * ============================================================
+ *  刻意【不】调 record_sample():历史环的采样节拍由 PC 那条 0.5 秒的
+ *  流定义,两个来源用不同节拍写同一个环会把 s_interval_ms 和横轴搞乱。
+ *  PC 不在时历史不记,但主页面那两根柱是直接读 s_st 的,照样工作。
+ */
+static void SysmonRtTask(void *arg)
+{
+    (void)arg;
+
+    int srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (srv < 0) {
+        ESP_LOGE(TAG, "路由器流:创建套接字失败 errno=%d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+    int yes = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons(SYSMON_RT_PORT);
+
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(srv, 1) != 0) {
+        ESP_LOGE(TAG, "路由器流:监听 %d 端口失败 errno=%d", SYSMON_RT_PORT, errno);
+        close(srv);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "路由器流量已就绪:监听 %d 端口,等路由器连过来", SYSMON_RT_PORT);
+
+    for (;;) {
+        struct sockaddr_in cli;
+        socklen_t clen = sizeof(cli);
+        int fd = accept(srv, (struct sockaddr *)&cli, &clen);
+        if (fd < 0) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        snprintf(s_rt_peer, sizeof(s_rt_peer), "%s", inet_ntoa(cli.sin_addr));
+
+        /*★ 日志要带迟滞:路由器每秒都会重连一次,逐次记日志会把串口刷爆。
+           s_rt_last_us 是"上一次真收到数据"的时间 —— 它比 30 秒还旧,
+           说明中间确实断过一阵,这才值得记一笔。 */
+        int64_t now_us   = esp_timer_get_time();
+        bool    rebacked = (!s_rt_last_us) ||
+                           ((now_us - s_rt_last_us) > RT_LOUD_US);
+        if (rebacked) {
+            ESP_LOGI(TAG, "路由器 %s 已连接,开始接收 WAN 流量", s_rt_peer);
+        }
+        s_rt_last_us = now_us;
+
+        char buf[256];
+        int  have = 0;
+
+        for (;;) {
+            int got = recv(fd, buf + have, sizeof(buf) - 1 - have, 0);
+            if (got <= 0) {
+                break;
+            }
+            have += got;
+
+            char *start = buf;
+            char *nl;
+            while ((nl = memchr(start, '\n', (size_t)(buf + have - start))) != NULL) {
+                *nl = '\0';
+                parse_line(start);
+                s_rt_last_us = esp_timer_get_time();
+                start = nl + 1;
+            }
+
+            int rest = (int)(buf + have - start);
+            if (rest > 0) {
+                memmove(buf, start, (size_t)rest);
+            }
+            have = rest;
+            if (have >= (int)sizeof(buf) - 1) {
+                have = 0;
+            }
+        }
+
+        close(fd);
+
+        /* 同理:短连接一秒一次,只有"这一条居然保持了很久"才值得说一声 */
+        if (esp_timer_get_time() - now_us > RT_LOUD_US) {
+            ESP_LOGW(TAG, "路由器 %s 断开", s_rt_peer);
+        }
+    }
+}
+
+/* ============================================================
  *  对外接口
  * ============================================================ */
 esp_err_t Sysmon_Start(void)
@@ -493,7 +643,9 @@ esp_err_t Sysmon_Start(void)
         return ESP_FAIL;
     }
 
-    /* 历史缓冲放 PSRAM:281 KB 从内部 DRAM 出不起,PSRAM 随便放。
+    /* 历史缓冲放 PSRAM。曲线页只看最新 78 秒,所以这里只要 2.2 KB ——
+       内部 DRAM 其实也塞得下,但没必要去挤:那点余量是留给
+       WiFi 协议栈和 I2S DMA 的。
        ★ 实际容量存进 s_cap —— 退化分配时环形下标必须用 s_cap,
          用 SYSMON_HIST_MAX 会越界写。 */
     size_t bytes = (size_t)SYSMON_HIST_MAX * sizeof(SysSample_t);
@@ -526,6 +678,13 @@ esp_err_t Sysmon_Start(void)
         ESP_LOGE(TAG, "创建任务失败");
         return ESP_FAIL;
     }
+
+    /* 路由器那条流:优先级略低、栈也小一号 —— 它每秒才一行,
+       丢了数据也只是晚一帧,不影响实时性 */
+    if (xTaskCreatePinnedToCore(SysmonRtTask, "sysmon_rt", 4096, NULL, 3,
+                                NULL, 0) != pdPASS) {
+        ESP_LOGW(TAG, "路由器流任务创建失败,只有 PC 的数据可用");
+    }
     return ESP_OK;
 }
 
@@ -548,37 +707,48 @@ void Sysmon_GetStatus(SysStatus_t *out)
     out->connected = s_connected;
     out->hist_count = s_count;
     out->sample_ms  = s_interval_ms ? s_interval_ms : 500;
+
+    /* 路由器:判据见 rt_fresh() 上面的注释 —— 只看数据新鲜度,
+       不看 TCP 是否正连着 */
+    out->rt_ok = rt_fresh();
 }
 
-int Sysmon_GetDecimated(SysSample_t *out, int n)
+/*
+ * 降采样核心。调用者必须已经持有 s_lock。
+ *   n      = 输出几根柱子
+ *   window = 只统计【最新】这么多个原始点;<=0 或超过总数 = 取全部历史
+ * 返回实际填了几个点。
+ *
+ * 环形缓冲里存着 78 秒(约 173 个点),但屏幕上只有 78 根柱子,
+ * 所以一定要降采样。把 window 单独抽出来,是为了让曲线页能
+ * "只看最近 78 秒" —— 见 user_app 里的 SYS_WINDOW_S。
+ */
+static int decimate_locked(SysSample_t *out, int n, int window)
 {
-    if (!s_hist || !s_lock || !out || n <= 0) {
-        return 0;
-    }
-    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+    const int total = s_count;
+    if (total <= 0 || n <= 0) {
         return 0;
     }
 
-    int cnt = s_count;
-    if (cnt <= 0) {
-        xSemaphoreGive(s_lock);
-        return 0;
-    }
-    if (n > cnt) {
-        n = cnt;
+    /* 窗口 = 最新 want 个原始点;first 是窗口起点在"从最旧数起"里的序号 */
+    const int want  = (window > 0 && window < total) ? window : total;
+    const int first = total - want;
+
+    if (n > want) {
+        n = want;
     }
 
     /* 最旧的点在环形缓冲里的位置 */
-    int oldest = (s_head - cnt + s_cap) % s_cap;
+    const int oldest = (s_head - total + s_cap) % s_cap;
 
     for (int i = 0; i < n; i++) {
-        int a = (int)((int64_t)i * cnt / n);
-        int b = (int)((int64_t)(i + 1) * cnt / n);
+        int a = first + (int)((int64_t)i * want / n);
+        int b = first + (int)((int64_t)(i + 1) * want / n);
         if (b <= a) {
             b = a + 1;
         }
-        if (b > cnt) {
-            b = cnt;
+        if (b > total) {
+            b = total;
         }
 
         unsigned sc = 0, sg = 0, sr = 0, t1 = 0, t2 = 0, k = 0;
@@ -604,6 +774,23 @@ int Sysmon_GetDecimated(SysSample_t *out, int n)
         out[i].up   = (uint32_t)(d2 / k);
     }
 
-    xSemaphoreGive(s_lock);
     return n;
+}
+
+int Sysmon_GetDecimated(SysSample_t *out, int n)
+{
+    return Sysmon_GetDecimatedWindow(out, n, 0);    /* 0 = 整段历史 */
+}
+
+int Sysmon_GetDecimatedWindow(SysSample_t *out, int n, int window)
+{
+    if (!s_hist || !s_lock || !out || n <= 0) {
+        return 0;
+    }
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return 0;
+    }
+    int r = decimate_locked(out, n, window);
+    xSemaphoreGive(s_lock);
+    return r;
 }

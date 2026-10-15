@@ -41,7 +41,24 @@ static bool                         s_mic_open = false;
 
 static bool s_ready  = false;
 static bool s_opened = false;
-static int  s_volume = 70;
+
+/* 默认音量 0~100。★ 100 就是这个 API 的【上限】,不是随手挑的数。
+ *
+ *   驱动里有一条写死的音量曲线(esp_codec_dev.c 的 _get_default_vol_curve):
+ *       vol = 0   -> -50.0 dB   (vol==0 另特判成 -96dB = 静音)
+ *       vol = 100 ->   0.0 dB
+ *     中间线性插值 → 每 1 个单位 = 0.5 dB
+ *     所以 **70 只对应 -15 dB**,白白少了 15 dB。
+ *
+ *   然后 es8311_set_vol 会把 hw_gain 减掉再写寄存器:
+ *       hw_gain = 20*log10(codec_dac_voltage / pa_voltage) + pa_gain
+ *               = 20*log10(3.3/5.0) + 6.0 = +2.39 dB
+ *     于是 vol=100 实际落在寄存器 -2.4 dB 上。
+ *
+ *   ES8311 的 DAC 音量寄存器范围是 -95.5dB ~ **+32dB**(0x00~0xFF),
+ *   所以还富余 34dB。但**不要**去抬 —— 16bit PCM 的数字满刻度已经用满,
+ *   再加就是纯粹的削顶失真。vol=100 就是不失真的实际顶点。 */
+static int  s_volume = 100;
 /* 当前采样率。默认 48000,播 TF 卡上 44.1kHz 的 WAV 时会临时改掉。 */
 static uint32_t s_rate = AUDIO_SAMPLE_RATE;
 
@@ -52,12 +69,22 @@ static esp_err_t InitI2s(void)
 {
     i2s_chan_config_t chan_cfg =
         I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    /* 网络推流最怕 DMA 饿死。原来 6 x 240 帧 @48kHz 只有 30ms,
-       WiFi 一抖就成静音间隙(听着就是"断断续续")。
-       改成 8 x 512 帧 = 每方向约 106ms,给网络留足抖动余量。
-       TX/RX 各占 16KB 内部 DMA 内存。 */
+    /* ★ I2S DMA 深度 = 【端到端延迟的下限】之一,别随便加大。
+       8 x 256 帧 @48kHz 立体声 = 2048 帧 = 42.7ms(每方向)。
+
+       历史:最初 6 x 240 帧只有 30ms,WiFi 一抖就成静音间隙;
+       2026-10 之前一直是 8 x 512 帧 = 85ms,纯粹是为了抗 WiFi 抖动。
+       现在降到 42.7ms —— 理由是【抗抖动的活其实不该由 DMA 来干】:
+         - 网络抖动由 TCP 接收窗口(16KB = 85ms)吸收,那块数据躺在
+           套接字缓冲里,recv 随时能拿到,DMA 不会被网络饿到;
+         - DMA 只需要盖住"两次 Audio_PlayPcm 之间的调度间隔",
+           而每次写 4096 字节 = 21.3ms,所以 42.7ms 正好是 2 倍的余量。
+       降下来对两条路都有好处:Type-C(USB)推流和 TF 卡本地播放都是
+       延迟直接少 42ms。
+       ⚠️ 如果 WiFi 推流又开始断续,先把这里调回 dma_frame_num = 512,
+          并确认 CONFIG_LWIP_TCP_WND_DEFAULT 还是 16384。 */
     chan_cfg.dma_desc_num  = 8;
-    chan_cfg.dma_frame_num = 512;
+    chan_cfg.dma_frame_num = 256;
     chan_cfg.auto_clear    = true;   /* 没数据时输出 0,避免喇叭沙沙声 */
 
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_tx, &s_rx),

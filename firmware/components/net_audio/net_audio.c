@@ -8,6 +8,9 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -41,6 +44,8 @@ static volatile bool s_retake = false;
 
 /* 板子现在想不想要电脑的声音?由 user_app 注册,见 net_audio.h。 */
 static bool (*s_want_fn)(void) = NULL;
+/* USB 建流时通知界面把源切到"电脑推流" */
+static void (*s_take_fn)(void) = NULL;
 
 /* 诊断用:上一次写 I2S 的结果,以及有没有成功写过第一次。
    原来写失败是静默 continue,一声不响 —— 出问题时完全看不出卡在哪。 */
@@ -54,7 +59,38 @@ static int        s_silent_sec = 0;
 static TickType_t s_next_rep   = 0;
 
 #define CHUNK_BYTES   4096
-static uint8_t s_buf[CHUNK_BYTES];
+EXT_RAM_BSS_ATTR static uint8_t s_buf[CHUNK_BYTES];
+
+/* ============================================================
+ *  USB(Type-C)推流 —— 和 TCP 完全并列的第二条通路
+ * ============================================================
+ *  为什么延迟能比 WiFi 低(不是"USB 快",而是"USB 稳"):
+ *    - 没有 TCP 接收窗口那一段在途缓冲(那边 16KB = 4096 帧 ≈ 85ms)
+ *    - 全速 USB 几乎无抖动,不需要为了抗抖动把缓冲做大
+ *
+ *  ★★ 为什么不用担心日志混进音频 ★★
+ *    USB CDC 的收和发是【两个独立端点】:
+ *       板子日志 -> IN 端点(板子 -> 电脑)
+ *       音频 PCM -> OUT 端点(电脑 -> 板子)
+ *    日志根本不在音频那根管子里。实测证据:RX 全速灌 4MB 的同时板子
+ *    每秒都在打日志,收到的仍是精确的 4194304 字节,零丢包。
+ *    所以这一层【不需要】静音日志,也不怕电脑侧读到日志。
+ *
+ *  唯一要小心的是【板子往 USB 写】:console 默认走"裸寄存器 + 忙等",
+ *  和应用用驱动写 TX 会互相破坏(实测 TX 直接卡死)。所以进任务时调一次
+ *  usb_serial_jtag_vfs_use_driver(),让全端口只剩一个写者。
+ */
+#define USB_IDLE_RELEASE_MS  1500     /* 1.5 秒没数据就当电脑停了 */
+
+static volatile bool    s_usb_on      = false;
+static volatile int64_t s_usb_last_us = 0;
+/* USB 这条自己的峰值统计(别和 TCP 那条共用,两条可能同时在跑) */
+static int              s_upk         = 0;
+static TickType_t       s_unext       = 0;
+EXT_RAM_BSS_ATTR static uint8_t s_usb_buf[CHUNK_BYTES];
+
+/* 该函数只在 esp_private 头里间接出现,自己 extern */
+extern void usb_serial_jtag_vfs_use_driver(void);
 
 /* 推流期间把 WiFi 省电关掉。
    省电模式(MIN_MODEM)会让射频在信标之间打盹,往返延迟从几毫秒涨到
@@ -244,7 +280,7 @@ static void StreamTask(void *arg)
 
         close(fd);
         s_cli_fd    = -1;
-        s_streaming = false;
+        s_streaming = s_usb_on;   /* ★ 别直接置 false —— USB 那条可能还在推 */
         s_yield     = false;        /* 连接没了,"让出"也就无从谈起 */
         s_retake    = false;
         s_peer[0]   = '\0';
@@ -255,6 +291,142 @@ static void StreamTask(void *arg)
     }
 }
 
+/* ============================================================
+ *  USB 推流任务
+ * ============================================================ */
+static void UsbStreamTask(void *arg)
+{
+    (void)arg;
+
+    usb_serial_jtag_driver_config_t cfg = {
+        .tx_buffer_size = 1024,
+        .rx_buffer_size = 8192,
+    };
+    esp_err_t r = usb_serial_jtag_driver_install(&cfg);
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "USB 音频驱动装不上(%s),Type-C 推流不可用", esp_err_to_name(r));
+        vTaskDelete(NULL);
+        return;
+    }
+    /* console 也切到驱动环形缓冲,见上面那段注释 */
+    usb_serial_jtag_vfs_use_driver();
+
+    ESP_LOGI(TAG, "USB 音频已就绪:可直接往 Type-C 串口写 48k/2ch/16bit PCM");
+
+    int have = 0;
+    for (;;) {
+        /* 从"让出"切回"独占"的重配置在这条路上也要做一份 ——
+           MusicTask 可能正占着 I2S,只有本任务知道自己还在不在写。 */
+        if (s_retake && s_streaming) {
+            s_retake = false;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            Audio_SetSampleRate(48000);
+            Spectrum_SetSampleRate(48000);
+            Audio_Mute(s_paused);
+            Spectrum_Enable(true);
+            ESP_LOGI(TAG, "USB:喇叭已收回:采样率 %u 音量 %d",
+                     (unsigned)Audio_GetSampleRate(), Audio_GetVolume());
+        }
+
+        /* 先处理攒满的一整块,再去读 —— 反过来的话 have==CHUNK_BYTES 时
+           会拿长度 0 去读,被当成"没数据",白等一个超时 */
+        if (have >= CHUNK_BYTES) {
+            have -= have % 4;                 /* 对齐到"一帧立体声 = 4 字节" */
+
+            /* ★ 每秒把收到的峰值打出来。没有这一句,"没声音"就无从下手:
+               到底是【没收到数据】还是【收到的就是静音】还是【收到了但没放】,
+               三种情况日志长得一模一样。TCP 那条一直有,USB 这条当初漏加了。 */
+            {
+                const int16_t *pcm = (const int16_t *)s_usb_buf;
+                int            n   = have / 2;
+                for (int i = 0; i < n; i++) {
+                    int v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+                    if (v > s_upk) {
+                        s_upk = v;
+                    }
+                }
+            }
+            if (xTaskGetTickCount() >= s_unext) {
+                s_unext = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+                ESP_LOGI(TAG, "USB 收到:峰值 %d/32767  块 %d 字节  让出=%d 暂停=%d 音量=%d 采样率=%u",
+                         (int)s_upk, have, (int)s_yield, (int)s_paused,
+                         Audio_GetVolume(), (unsigned)Audio_GetSampleRate());
+                s_upk = 0;
+            }
+
+            if (s_yield) {
+                have = 0;                     /* 让出通道期间照收照丢 */
+            } else if (have > 0) {
+                esp_err_t wr = Audio_PlayPcm(s_usb_buf, (size_t)have);
+                if (wr != ESP_OK) {
+                    if (s_last_wr == ESP_OK) {
+                        ESP_LOGW(TAG, "USB:Audio_PlayPcm 失败: %s", esp_err_to_name(wr));
+                    }
+                    s_last_wr = wr;
+                } else {
+                    if (s_last_wr != ESP_OK) {
+                        ESP_LOGI(TAG, "USB:Audio_PlayPcm 恢复正常");
+                    }
+                    s_last_wr = ESP_OK;
+                    if (!s_logged_first) {
+                        s_logged_first = true;
+                        ESP_LOGI(TAG, "USB 已向 I2S 写入第一块音频: %d 字节", have);
+                    }
+                }
+                if (s_spec_on) {
+                    Spectrum_Feed((const int16_t *)s_usb_buf, (size_t)have / 4);
+                }
+                have = 0;
+            }
+        }
+
+        int got = usb_serial_jtag_read_bytes(s_usb_buf + have,
+                                             (uint32_t)(CHUNK_BYTES - have),
+                                             pdMS_TO_TICKS(100));
+        if (got > 0) {
+            have += got;
+            s_usb_last_us = esp_timer_get_time();
+            if (!s_usb_on) {
+                /* 从"没数据"变成"有数据" = 电脑开始推流了 */
+                if (Audio_GetSampleRate() != 48000) {
+                    Audio_SetSampleRate(48000);
+                }
+                Spectrum_SetSampleRate(48000);
+                /* ★ USB 这条【直接接管喇叭】,不像 WiFi 那样先问板子。
+                   理由见 net_audio.h 里 NetAudio_SetTakeCallback 的说明:
+                   运行 wascap --usb 本身就是"我要听电脑"的意思,而切源
+                   那个选择一复位就丢、用户还看不出来。
+                   先通知界面把源也切过来 —— 不然屏幕写着"来自本地",
+                   耳朵里却是电脑的声音,那种"看到的和听到的对不上"
+                   是最难查的一类问题。 */
+                if (s_take_fn != NULL) {
+                    s_take_fn();
+                }
+                s_yield = false;
+                Audio_Mute(s_yield);
+                Spectrum_Enable(!s_yield);
+                s_streaming    = true;
+                s_usb_on       = true;
+                s_paused       = false;
+                s_logged_first = false;
+                s_last_wr      = ESP_OK;
+                ESP_LOGI(TAG, "USB 推流开始%s",
+                         s_yield ? "(但当前选的不是电脑推流,先只收不放)" : "");
+            }
+        } else if (s_usb_on &&
+                   (esp_timer_get_time() - s_usb_last_us) > (int64_t)USB_IDLE_RELEASE_MS * 1000) {
+            /* 电脑停了(关程序 / 拔线 / 长时间没数据)—— 交还喇叭 */
+            s_usb_on    = false;
+            s_streaming = (s_cli_fd >= 0);     /* TCP 那边还连着就别踩掉 */
+            s_yield     = false;
+            s_retake    = false;
+            Audio_Mute(true);
+            Spectrum_Enable(false);
+            ESP_LOGI(TAG, "USB 推流停止,交还播放通道");
+        }
+    }
+}
+
 esp_err_t NetAudio_Start(void)
 {
     /* 钉在核 0:WiFi 协议栈也在那边,减少跨核搬运 */
@@ -262,6 +434,11 @@ esp_err_t NetAudio_Start(void)
                                 NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "创建网络音频任务失败");
         return ESP_FAIL;
+    }
+    /* USB(Type-C)那条。钉核 1:不跟 WiFi 协议栈抢核 0。 */
+    if (xTaskCreatePinnedToCore(UsbStreamTask, "usb_audio", 6144, NULL, 4,
+                                NULL, 1) != pdPASS) {
+        ESP_LOGW(TAG, "创建 USB 音频任务失败,只有 WiFi 那条路可用");
     }
     return ESP_OK;
 }
@@ -308,6 +485,11 @@ bool NetAudio_SetYield(bool yield_it)
 void NetAudio_SetWantCallback(bool (*fn)(void))
 {
     s_want_fn = fn;
+}
+
+void NetAudio_SetTakeCallback(void (*fn)(void))
+{
+    s_take_fn = fn;
 }
 
 bool NetAudio_RequestStop(void)

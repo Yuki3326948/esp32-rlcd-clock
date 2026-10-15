@@ -37,6 +37,7 @@ echo     wascap.exe                        推【默认输出设备】的声音�
 echo     wascap.exe --device USB           按名字子串指定输出设备
 echo     wascap.exe --host 192.168.1.182   手动指定板子 IP
 echo     wascap.exe --gain 0.5             软件衰减(0~4)
+echo     wascap.exe --usb [COMx]          走 Type-C 串口,不经 WiFi
 echo.
 echo   平时直接双击上一级目录的「推电脑声音到板子.bat」更省事。
 echo.

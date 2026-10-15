@@ -1,4 +1,4 @@
-/*
+﻿/*
  * wascap.exe —— 用 WASAPI 回环把"电脑正在播放的声音"采下来,推给 ESP32 板子。
  *
  * 为什么要自己写
@@ -25,6 +25,18 @@
  *   wascap.exe --device USB           按名字子串挑一个输出设备
  *   wascap.exe --host 192.168.1.182   手动指定板子 IP
  *   wascap.exe --gain 0.5             软件衰减(超过 1.0 不放大,避免削顶)
+ *   wascap.exe --usb                  走 Type-C:自动找 ESP32 的 COM 口
+ *   wascap.exe --usb COM7             走 Type-C:手动指定串口
+ *
+ * 【为什么要有 --usb:不是"USB 更快",是"USB 更稳"】
+ *   WiFi 那条路上,16KB 的 TCP 接收窗口本身就是约 85ms 的在途数据,
+ *   再叠上为了抗网络抖动而做大的 I2S DMA,端到端两百多毫秒。
+ *   全速 USB 几乎不抖,板子那边把 I2S DMA 降到 42.7ms 就够 ——
+ *   延迟是由"缓冲"决定的,缓冲小了延迟就低下来了。
+ *
+ *   还有一点很关键:USB CDC 的收和发是【两个独立端点】,
+ *   板子的日志走 IN(板子->电脑),音频 PCM 走 OUT(电脑->板子),
+ *   两者根本不在一根管子里,所以这条路【不需要】静音板子日志。
  *
  * 编译(本目录下)
  *   csc /nologo /target:exe /platform:x64 /optimize+ /out:wascap.exe wascap.cs
@@ -34,11 +46,13 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Ports;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 
 /* ============================================================
  *  1. WASAPI 的 COM 接口声明
@@ -563,6 +577,54 @@ internal static class Paths
 }
 
 /* ============================================================
+ *  6b. 找 ESP32 的 USB 串口(读注册表,不依赖 WMI)
+ * ============================================================
+ *  ESP32-S3 自带的 USB-Serial-JTAG 在 Windows 上就是个 COMx,
+ *  硬件 ID 是 VID_303A&PID_1001。用 SetupAPI / WMI 都能查,
+ *  但读注册表最省事:
+ *      HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_303A&PID_1001\<实例>
+ *          \Device Parameters\PortName   ->  "COM5"
+ */
+internal static class UsbPort
+{
+    private const string ENUM = @"SYSTEM\CurrentControlSet\Enum\USB";
+
+    public static List<string> AllEsp32()
+    {
+        List<string> found = new List<string>();
+        try
+        {
+            using (RegistryKey root = Registry.LocalMachine.OpenSubKey(ENUM))
+            {
+                if (root == null) return found;
+                foreach (string vend in root.GetSubKeyNames())
+                {
+                    if (vend.IndexOf("VID_303A", StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+                    using (RegistryKey dev = root.OpenSubKey(vend))
+                    {
+                        if (dev == null) continue;
+                        foreach (string inst in dev.GetSubKeyNames())
+                        {
+                            using (RegistryKey dp = dev.OpenSubKey(inst + @"\Device Parameters"))
+                            {
+                                if (dp == null) continue;
+                                object pn = dp.GetValue("PortName");
+                                if (pn == null) continue;
+                                string name = pn.ToString();
+                                if (name.Length > 0 && !found.Contains(name)) found.Add(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+        return found;
+    }
+}
+
+/* ============================================================
  *  7. 主程序
  * ============================================================ */
 internal static class Program
@@ -577,6 +639,8 @@ internal static class Program
     private static string g_host  = null;
     private static string g_device = null;
     private static bool   g_list  = false;
+    /* null = 走 WiFi/TCP;"" = 走 USB 且自动找口;"COM5" = 走 USB 且指定口 */
+    private static string g_usb   = null;
 
     private static int Main(string[] argv)
     {
@@ -635,6 +699,17 @@ internal static class Program
             if (s == "--list") { g_list = true; continue; }
             if (s == "--host" && i + 1 < a.Length) { g_host = a[++i]; continue; }
             if (s == "--device" && i + 1 < a.Length) { g_device = a[++i]; continue; }
+            if (s == "--usb")
+            {
+                g_usb = "";
+                /* --usb 后面可以跟 COMx,也可以不跟 */
+                if (i + 1 < a.Length && a[i + 1].Length >= 3 &&
+                    a[i + 1].Substring(0, 3).Equals("COM", StringComparison.OrdinalIgnoreCase))
+                {
+                    g_usb = a[++i];
+                }
+                continue;
+            }
             if (s == "--gain" && i + 1 < a.Length)
             {
                 double g;
@@ -653,6 +728,7 @@ internal static class Program
             {
                 Console.WriteLine("用法: wascap.exe [--list] [--device 名字子串] "
                                   + "[--host 板子IP] [--gain 0.1~4]");
+                Console.WriteLine("      wascap.exe --usb [COMx]     走 Type-C 串口,不经 WiFi");
                 return false;
             }
             Console.WriteLine("[X] 不认识的参数: " + s);
@@ -687,6 +763,9 @@ internal static class Program
         Console.WriteLine("输出格式 : " + OUT_RATE + " Hz / " + OUT_CH + "ch / 16bit"
                           + (resample ? "  (需要重采样)" : "  (直通,不重采样)")
                           + (ev ? "   [事件驱动]" : "   [8ms 轮询]"));
+
+        /* ---- USB(Type-C)模式:整段 TCP 逻辑都跳过 ---- */
+        if (g_usb != null) return RunUsb(cc, mix, ac, fmt, resample, ev);
 
         /* ---- 找板子并连上 ---- */
         TcpClient sock = null;
@@ -731,12 +810,15 @@ internal static class Program
             }
         }
 
+        NetworkStream nsTcp = sock.GetStream();
+
         /* 板子重启 / WiFi 掉线时自动重连,不用重新启动本程序 */
         while (true)
         {
             try
             {
-                Pump(cc, mix, ac, sock, resample, ev);
+                Pump(cc, mix, ac, nsTcp,
+                     delegate { return StopRequested(sock, nsTcp); }, null, resample, ev);
                 break;                          /* 正常收尾 */
             }
             catch (Exception ex)
@@ -745,6 +827,7 @@ internal static class Program
             }
             try { sock.Close(); } catch { }
             sock = Reconnect(host);
+            nsTcp = sock.GetStream();
         }
 
         /* 收尾:停流 + 释放资源 */
@@ -755,6 +838,107 @@ internal static class Program
 
         Console.WriteLine("已停止");
         return 0;
+    }
+
+    /*
+     * Type-C(USB 串口)那条路。
+     *
+     * 和 TCP 那条的差别:
+     *   - 不是 socket 是串口。板子吃 48000 x 2ch x 2B = 192KB/s,
+     *     实测这个口能跑 630KB/s,留了 3 倍余量。
+     *   - 没有"板子叫我停"的反向通道(STOP 命令只有 TCP 那边发),
+     *     所以停就按 Ctrl+C,或者在板子上切走。
+     *   - 板子的日志会从这个口回来,这里【故意不读】:要在音频线程里
+     *     解析文本反而添乱。板子那边 RX 满了会丢日志,而丢日志不影响
+     *     音频 —— 日志走 IN 端点,音频走 OUT 端点,两条独立的管子。
+     */
+    private static int RunUsb(IAudioCaptureClient cc, MixInfo mix, IAudioClient ac,
+                              IntPtr fmt, bool resample, bool ev)
+    {
+        string port = g_usb;
+        if (port.Length == 0)
+        {
+            List<string> cand = UsbPort.AllEsp32();
+            if (cand.Count == 0)
+            {
+                Console.WriteLine("[X] 没找到 ESP32 的 USB 串口(注册表里没有 VID_303A)。");
+                Console.WriteLine("    确认 Type-C 线是【数据线】,或者用 --usb COM5 手动指定。");
+                return 1;
+            }
+            if (cand.Count > 1)
+            {
+                Console.WriteLine("[!] 有多个 ESP32 串口,先用 " + cand[0]
+                                  + "  (全部: " + string.Join(", ", cand.ToArray()) + ")");
+            }
+            port = cand[0];
+        }
+
+        Console.WriteLine("输出端口 : " + port + "   [Type-C / USB 串口]");
+        Console.WriteLine("提示     : 这条路没有反向停止通道,退出请按 Ctrl+C");
+
+        SerialPort sp = OpenUsb(port);
+        if (sp == null) return 1;
+
+        Stream us;
+        try { us = sp.BaseStream; }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[X] 拿不到串口流:" + ex.Message);
+            try { sp.Close(); } catch { }
+            return 1;
+        }
+
+        while (true)
+        {
+            try
+            {
+                Pump(cc, mix, ac, us, null, sp, resample, ev);
+                break;                                  /* 正常收尾 */
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("\n[!] USB 中断(" + ex.Message + "),3 秒后重开串口 ...");
+            }
+            try { sp.Close(); } catch { }
+            Thread.Sleep(3000);
+            SerialPort again = OpenUsb(port);
+            if (again == null) continue;
+            sp = again;
+            try { us = sp.BaseStream; } catch { continue; }
+            Console.WriteLine("已重开 : " + port);
+        }
+
+        try { ac.Stop(); } catch { }
+        if (Loopback.EventHandle != IntPtr.Zero) Loopback.Close(Loopback.EventHandle);
+        if (fmt != IntPtr.Zero) Com.CoTaskMemFree(fmt);
+        try { sp.Close(); } catch { }
+
+        Console.WriteLine("已停止");
+        return 0;
+    }
+
+    /*
+     * 开串口。★ DTR/RTS 一定要保持 false ★
+     * 拉起来会走板子的自动复位时序,而这个口同时还是烧录用的口,
+     * 平白复位一下会丢掉正在放的音频。
+     */
+    private static SerialPort OpenUsb(string port)
+    {
+        try
+        {
+            SerialPort sp = new SerialPort(port, 115200);
+            sp.DtrEnable = false;
+            sp.RtsEnable = false;
+            sp.WriteBufferSize = 65536;
+            sp.WriteTimeout = 3000;
+            sp.Open();
+            return sp;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[X] 打不开 " + port + ":" + ex.Message);
+            return null;
+        }
     }
 
     /* 断线后一直重试(直到用户 Ctrl+C) */
@@ -785,7 +969,8 @@ internal static class Program
      * 一个缓冲块的时长(几毫秒),不会让采集断流。
      */
     private static void Pump(IAudioCaptureClient cc, MixInfo mix, IAudioClient ac,
-                             TcpClient sock, bool resample, bool ev)
+                             Stream ns, Func<bool> stopCheck, SerialPort logPort,
+                             bool resample, bool ev)
     {
         byte[] toBytes = null;      /* 转换后的输出缓冲,按需扩容后复用 */
         float[] ch0 = new float[8192];
@@ -794,14 +979,55 @@ internal static class Program
         float last0 = 0f, last1 = 0f;
         int  rateRatio = resample ? mix.Rate : OUT_RATE;
 
-        NetworkStream ns = sock.GetStream();
         Stopwatch sw = Stopwatch.StartNew();
         long lastTick = 0, sentBytes = 0;
+        int  peak = 0;      /* 这一秒里采到的最大样本绝对值 */
+
+        /* 板子日志的行缓冲(logPort 为 null 时整个功能关掉) */
+        MemoryStream logBuf = (logPort != null) ? new MemoryStream(256) : null;
+        byte[] logTmp = new byte[1024];
 
         while (true)
         {
-            /* --- 板子有没有让我们停下? --- */
-            if (StopRequested(sock, ns)) return;
+            /* --- 板子有没有让我们停下?(USB 那条没有反向通道,stopCheck 是 null) --- */
+            if (stopCheck != null && stopCheck()) return;
+
+            /* --- 顺手把板子的日志回显出来 ---
+               USB CDC 的收和发是【两个独立端点】,读日志不会干扰
+               正在写的音频那根管子。而且必须读:不读的话板子那边的
+               TX 环形缓冲会满,日志就被丢了,看不到"USB 推流开始"
+               这类关键信息。*/
+            if (logPort != null)
+            {
+                try
+                {
+                    while (logPort.BytesToRead > 0)
+                    {
+                        int want = logPort.BytesToRead;
+                        if (want > logTmp.Length) want = logTmp.Length;
+                        int r = logPort.Read(logTmp, 0, want);
+                        if (r <= 0) break;
+                        for (int k = 0; k < r; k++)
+                        {
+                            byte b = logTmp[k];
+                            if (b == 10)
+                            {
+                                /* ★ 必须按 UTF-8 解码。板子打的是 UTF-8 中文,
+                                   若按"一个字节一个字符"拼,中文会变成
+                                   "å·æ°èæ¶" 这种乱码。*/
+                                string line = Encoding.UTF8.GetString(logBuf.ToArray()).TrimEnd('\r');
+                                logBuf.SetLength(0);
+                                if (line.Length > 0) Console.Write("\r[板子] " + line + "\n");
+                            }
+                            else if (logBuf.Length < 512)
+                            {
+                                logBuf.WriteByte(b);
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
 
             /* --- 等数据 --- */
             uint packet;
@@ -851,6 +1077,17 @@ internal static class Program
                 {
                     ns.Write(toBytes, 0, outBytes);
                     sentBytes += outBytes;
+
+                    /* ★ 统计峰值。没有这一栏,"没声音"根本没法定位:
+                       到底是【没抓到声音】(峰值一直是 0 = 播放器没在出声,
+                       或者声音走了别的输出设备 / WASAPI 回环抓错了端点),
+                       还是【抓到了但板子没放】。*/
+                    for (int q = 0; q + 1 < outBytes; q += 2)
+                    {
+                        int v = (short)(toBytes[q] | (toBytes[q + 1] << 8));
+                        if (v < 0) v = -v;
+                        if (v > peak) peak = v;
+                    }
                 }
             }
 
@@ -859,7 +1096,9 @@ internal static class Program
             {
                 lastTick = now;
                 double secs = sentBytes / (double)(OUT_RATE * OUT_CH * 2);
-                Console.Write("\r  {0,6:F1} 秒", secs);
+                Console.Write("\r  {0,6:F1} 秒   峰值 {1,6}{2}", secs, peak,
+                              peak < 100 ? "  <- 电脑这边就是静音!" : "");
+                peak = 0;
             }
         }
         Console.WriteLine();

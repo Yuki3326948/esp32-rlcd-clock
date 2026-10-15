@@ -19,7 +19,11 @@ static const char *TAG = "battery";
 
 /* 趋势判定的窗口。Poll() 由 SensorTask 每 3 秒调一次,10 次 = 30 秒。 */
 #define BATT_TREND_POLLS   10
-#define BATT_FALL_MV       8               /* 30 秒内降超过 8mV 就算在放电 */
+#define BATT_FALL_MV       5    /* 30 秒降 5mV 以上 = 在放电 */
+#define BATT_RISE_MV       8    /* 30 秒升 8mV 以上 = 在充电 */
+/* 升的阈值故意比降的严:把"电池"误判成"外接"(图标赖着不走)最烦人,
+   而真在充电时 30 秒升幅远不止 8mV,只有快充满了才会变缓 ——
+   变缓那种情况本来就该"保持原状态",见 Poll() 里的说明。 */
 
 /* 一阶低通。ADC 读数有 ±10mV 抖动,不滤的话百分比会在 70/71 之间
    来回跳,顶栏每 3 秒白重画一次。右移 3 位 = 时间常数约 8 次采样 ≈ 24 秒;
@@ -38,15 +42,14 @@ static bool          s_has   = false;
 static int           s_level = 0;
 static Battery_Power s_power = BATTERY_POWER_UNKNOWN;
 
-/* 电压趋势:拿当前值和一分钟前的参考值比。
-   纯电池供电时屏幕 + WiFi 这个负载一定在持续掉压,
-   所以“没在降”就是接在外部电源上。 */
-static int s_ref_mv    = 0;
+/* 电压趋势:当前值 vs 30 秒前的值 */
+static int s_ref_mv    = 0;   /* 30 秒前的参考电压 mV */
 static int s_ref_cnt   = 0;
 static int s_mv_filt   = 0;   /* 低通后的电压 mV */
-static int s_trend     = 0;   /* 最近一个完整窗口的变化量 mV */
-static int s_windows   = 0;   /* 已经走完的趋势窗口数 */
+static int s_trend     = 0;   /* 最近一个窗口的变化量 mV */
 static int s_level_ref = 0;   /* 上次换档时的电压 mV(迟滞用) */
+/* 推断出来的"插着外接电源"。★ 必须是【有状态】的,见 Poll() 里的说明 */
+static bool s_ext      = false;
 
 esp_err_t Battery_Init(void)
 {
@@ -149,30 +152,61 @@ esp_err_t Battery_Poll(void)
         }
     }
 
-    /* ---------------- 供电 / 充电状态 ---------------- */
-    /* 依据一:USB 主机连着。插电脑时立刻为真,这条最可靠。
-       插充电头(不枚举数据)不会为真,那种情况靠下面的趋势。 */
+    /* ---------------- 供电 / 充电状态 ----------------
+     * ★★ 这块板子【没有】把充电 IC 的状态脚接到 GPIO(GPIO 表里只有
+     *    GPIO4 一个 ADC,其余全给屏幕/I2S/I2C/按键占了),所以"插着外接
+     *    电源"只能靠电压【推断】。既然是推断,就必须做成【有状态】的:
+     *
+     *      1) USB 主机连着  -> 外接(插电脑/笔记本时立刻为真,可靠)
+     *      2) 明显升压      -> 外接(在充电)
+     *      3) 明显掉压      -> 电池
+     *      4) 电压平稳      -> 【保持原状态】,不翻
+     *
+     *    第 4 条是这次改动的关键。原来写的是
+     *        external = usb_host || (trend > -8)
+     *    也就是"没掉压就当外接" —— 可电池平稳放电时电压本来就不怎么掉,
+     *    拔掉充电线几十秒后趋势一回到 0,它自己又翻回"外接",
+     *    插头图标就永远消不掉。
+     *    现在只认"明显的升降",平稳不动。
+     *
+     *    局限:插着"快充满了"的充电头时电压是平的,这时它说不清,
+     *    会保持上一刻的状态。这是硬件没给信号导致的,代码消不掉。
+     */
     bool usb_host = usb_serial_jtag_is_connected();
 
-    /* 依据二:电压趋势。每 30 秒结一次账,没降就当作外接。 */
+    /* 每 30 秒结一次账 */
     if (++s_ref_cnt >= BATT_TREND_POLLS) {
         s_ref_cnt = 0;
         if (s_ref_mv != 0) {
             s_trend = mv - s_ref_mv;
-            s_windows++;
-            ESP_LOGI(TAG, "电压趋势: %d -> %d mV (%+d / %d 秒)%s",
-                     s_ref_mv, mv, s_trend,
-                     BATT_TREND_POLLS * 3,
+            ESP_LOGI(TAG, "电压趋势: %d -> %d mV (%+d / %d 秒)  外接=%d%s",
+                     s_ref_mv, mv, s_trend, BATT_TREND_POLLS * 3, (int)s_ext,
                      usb_host ? "  [USB 主机已连接]" : "");
         }
         s_ref_mv = mv;
     }
-    /* 还没走完一个完整窗口之前不动用趋势(否则启动瞬间会误判成外接) */
-    bool external = usb_host || (s_windows > 0 && s_trend > -BATT_FALL_MV);
+
+    bool was_ext = s_ext;
+    if (usb_host) {
+        s_ext = true;                       /* 插着电脑,不用等窗口 */
+    } else if (s_trend >= BATT_RISE_MV) {
+        s_ext = true;                       /* 在升压 = 在充电 */
+    } else if (s_trend <= -BATT_FALL_MV) {
+        s_ext = false;                      /* 在掉压 = 电池供电 */
+    }
+    /* 其余(平稳)什么都不做 —— 这一行"不作为"就是这次的修复本身 */
+
+    if (s_ext != was_ext) {
+        ESP_LOGI(TAG, "电源 -> %s (趋势 %+d mV/%d 秒)",
+                 s_ext ? "外接电源" : "内部电池", s_trend, BATT_TREND_POLLS * 3);
+        /* 改判后从当前电平重新起算,免得旧台阶一直压着 */
+        s_ref_mv = mv;
+        s_trend  = 0;
+    }
 
     if (!s_has) {
         s_power = BATTERY_POWER_EXTERNAL_ONLY;   /* 没装电池,靠外接供电 */
-    } else if (external) {
+    } else if (s_ext) {
         s_power = (mv >= BATT_FULL_MV) ? BATTERY_POWER_FULL
                                        : BATTERY_POWER_CHARGING;
     } else {

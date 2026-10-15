@@ -1,8 +1,8 @@
 # ESP32-S3 RLCD 桌面时钟
 
 一块 **400×300 单色反射式液晶**上的桌面时钟。除了看时间,还能放 TF 卡里的音乐、
-跟着音乐跳频谱,并且把**电脑的 CPU / 内存 / GPU / 网速**实时显示出来
-(顶栏 5 根资源柱 + 一整页历史曲线)。
+跟着音乐跳频谱,把**电脑的 CPU / 内存 / GPU** 和**路由器 WAN 的上下行网速**实时显示出来
+(顶栏 5 根资源柱 + 一整页历史曲线),并显示**室外天气**(温度 + 天气图标)。
 
 硬件是 Waveshare **ESP32-S3-RLCD-4.2**。
 
@@ -22,15 +22,15 @@
 
 | 页面 | 内容 |
 |---|---|
-| **时钟页** | 时间(方块点阵大字)、日期星期、温湿度、电池/充电状态、WiFi 名、IP、TF 卡状态;左侧 5 根资源柱(CPU / GPU / 内存 / ↓ / ↑) |
+| **时钟页** | 时间(方块点阵大字)、日期星期、室内温湿度、**室外天气(温度 + 图标)**、电池/充电状态、WiFi 名、IP、TF 卡状态;左侧 5 根资源柱(CPU / GPU / 内存 / ↓ / ↑) |
 | **音乐页** | 播放 TF 卡里的 WAV;90 段实时频谱;三种频谱源可切换 |
-| **曲线页** | 4 张历史曲线:CPU% / GPU% / MEM% / 网速(Y 轴横向网格,X 轴显示时间跨度) |
+| **曲线页** | 4 张历史曲线:CPU% / GPU% / MEM% / 网速(**只画最近 78 秒**,一根柱子一秒;网速那张上下行镜像分开画,Y 轴网格对齐刻度) |
 
 **三种频谱源**(BOOT 键长按轮换):
 
 - `播放音乐` —— TF 卡里的 WAV
 - `麦克风` —— 板载 ES7210 麦克风阵列
-- `电脑推流` —— 电脑声音实时推过来
+- `电脑推流` —— 电脑声音实时推过来(WiFi 走 TCP 3333;**也可以插 Type-C 走串口**,见下)
 
 ---
 
@@ -59,6 +59,7 @@
 |---|---|
 | TCP **3333** | 电脑 → 板子推音频(裸 PCM 48000Hz/2ch/16bit LE;反向发 `STOP` 停流) |
 | TCP **3334** | 电脑 → 板子推资源遥测(每行一条 `键=值`,空格分隔) |
+| TCP **3335** | **路由器** → 板子推 WAN 上下行 + 室外天气(`键=值`,每秒一条) |
 
 BLE:`ESP32-RLCD`,服务 `0xAB00`(控制 `0xAB01` / 音量 `0xAB02` / 状态 `0xAB03`)
 
@@ -76,11 +77,12 @@ firmware/            ESP-IDF 工程
     spectrum/        4096 点 FFT → 90 个对数频段
     audio_player/    I2S 输出 + ES8311/ES7210
     wav_player/      TF 卡 WAV 读取
-    net_audio/       TCP 音频推流接收
-    sysmon/          PC 资源遥测接收 + 历史缓冲
+    net_audio/       TCP / USB 音频推流接收
+    sysmon/          PC 与路由器遥测接收 + 历史缓冲
+    ble_gate/        BLE 网关(第一版:只扫描,验证与 WiFi 推流共存)
     sdcard/ battery/ board_sensors/ ble_ctrl/ port_bsp/ u8g2_st7305/ u8g2/
-  main/
-  sdkconfig.defaults  ★ 关键配置(PSRAM 八线、16MB flash、TCP 窗口…)
+  main/              usb_test.c 是临时的 Type-C 吞吐实测(默认 USB_TEST 0,不启用)
+  sdkconfig.defaults  ★ 关键配置(PSRAM 八线、16MB flash、CPU 240MHz、TCP 窗口…)
 
 pc-tools/            电脑端
   pc_monitor.py       ★ 资源监视器上位机(推 CPU/内存/GPU/网速)
@@ -89,6 +91,7 @@ pc-tools/            电脑端
   capture.py          抓串口日志
   build.ps1           编译包装(固定大核,避开小核)
   fontgen/            界面字库 / 方块时钟字形的生成与预览工具
+  router-push/        ★ 路由器上跑的推送脚本(把 WAN 流量和天气推给板子)
 
 docs/                使用文档
   烧录说明.md          从零开始的烧录指南
@@ -157,11 +160,43 @@ python pc-tools/pc_monitor.py 192.168.1.182
 
 ```bash
 python pc-tools/stream_audio.py "某首歌.mp3"     # 推文件
-wascap\wascap.exe                                # 推电脑正在放的声音
+wascap\wascap.exe                                # 推电脑正在放的声音(WiFi)
 ```
 
 `wascap` 是 C# 写的 WASAPI 环回采集,零第三方依赖,用 `csc.exe` 直接编译成
 单个 exe(`pc-tools/wascap/build.bat`)。实测单核占用 0.5%。
+
+**也可以走 Type-C 串口**(不经 WiFi,延迟更低):
+
+```bash
+wascap\wascap.exe --usb            # 默认 COM 口
+wascap\wascap.exe --usb COM5       # 手动指定
+```
+
+或者直接双击 `pc-tools/推电脑声音到板子-USB.bat`。走 USB 时板子会**自动**把源
+切到「电脑推流」(WiFi 那条不会自动切,得手动切或按长按),所以插上线就有声。
+
+---
+
+## 路由器推送(可选)
+
+**想要室外天气 + 路由器 WAN 的真实上下行**,需要在**路由器**上挂一个小脚本
+(`pc-tools/router-push/`),让它每秒把数据推给板子:
+
+```sh
+# 装到路由器(OpenWrt):
+scp pc-tools/router-push/router_traffic.sh  root@192.168.1.1:/usr/bin/
+scp pc-tools/router-push/router_traffic.init root@192.168.1.1:/etc/init.d/router_traffic
+ssh root@192.168.1.1 "chmod +x /usr/bin/router_traffic.sh /etc/init.d/router_traffic"
+ssh root@192.168.1.1 "/etc/init.d/router_traffic enable && /etc/init.d/router_traffic start"
+```
+
+板子地址写死在脚本里(`BOARD_IP`,默认 `192.168.1.182`),改你自己的。
+不装这个也能用 —— 只是顶栏那两根 ↓/↑ 柱和天气不显示(室内温湿度仍然有,
+那份数据来自板载 SHTC3,不依赖网络)。
+
+为什么让**路由器**取天气而不是板子自己取:板子不联网,省掉 TLS 握手的
+十几 KB 内存尖峰;路由器 7x24 在线,而且已经知道自己的 WAN IP。
 
 ---
 

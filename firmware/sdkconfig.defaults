@@ -12,6 +12,16 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FREERTOS_HZ=1000
 
+# ---------- CPU 频率 ----------
+# ESP32-S3 的默认值是 160MHz,这个参数一直没人动过。
+# ★ 注意:本工程【没开】电源管理 / DFS(见 sdkconfig 里的 CONFIG_PM_ENABLE),
+#   所以不是"闲着降频、忙了升频",而是【一直】跑在设定的频率上。
+# 升到 240 的实测收益:频谱 FFT 7.10ms -> 约 4.7ms(占单核 16.6% -> 约 11%),
+#   刷屏像素运算、TCP 收包也都快 1.5 倍。
+# 代价:待机功耗和发热都会上去一点 —— 插着 USB 当桌面钟是划算的,
+#   纯靠电池跑就得权衡了。
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
 # ---------- 网络推流(电脑 -> ESP32 音频)----------
 # TCP 接收窗口默认只有 5760 字节,撑 48k/2ch/16bit 需要的 192KB/s
 # 要求往返延迟 <= 30ms。拉到 16KB,留出 85ms 余量。
@@ -29,3 +39,22 @@ CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 # 主机堆放到 PSRAM:内部 DRAM 留着给 LVGL 替代品和任务栈
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# ---------- WiFi 吞吐(和 BLE / PSRAM 并存时 IDF 会默认关掉)----------
+# ★ 这一组必须【显式写 y】。Kconfig 里它们的默认值是:
+#       default n if (BT_ENABLED && SPIRAM && SLAVE_IDF_TARGET_ESP32)
+#       default y
+#   本工程正好三条全中(BT + PSRAM + S3),所以不写的话默认落到 n。
+#   关掉的代价是 WiFi 收/发函数不在 IRAM 里,吞吐下降;而本工程要往板子
+#   推 192 KB/s 的音频,吞吐比省这点 IRAM 重要(实测板子上就是开着的)。
+CONFIG_WIFI_RMT_IRAM_OPT=y
+CONFIG_WIFI_RMT_RX_IRAM_OPT=y
+
+# ---------- 把大块静态缓冲区放到 PSRAM(内部 RAM 是这块板子最紧的资源)----------
+# 打开之后:
+#   1. lwip / net80211 / pp / bt 这几个库的 .bss 会【自动】搬到 PSRAM;
+#   2. 我们的代码里带 EXT_RAM_BSS_ATTR 的数组也搬到 PSRAM。
+# 实测内部 RAM 从 45KB 剩余提升到 ~77KB(见 user_app.cpp 的开机日志)。
+# 注意:EXT_RAM_BSS_ATTR 的变量【仍然是零初始化】的(IDF 保证),
+# 而且这个宏在开关关掉时会变成空宏,所以代码两边都能编译。
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y

@@ -3,7 +3,7 @@ idf_component_register(
     PRIV_REQUIRES main esp_driver_gpio port_bsp
                    esp_wifi esp_netif esp_event nvs_flash lwip
                    ui_draw board_sensors audio_player spectrum sdcard wav_player
-                   ble_ctrl net_audio battery sysmon
+                   ble_ctrl net_audio battery sysmon ble_gate
     INCLUDE_DIRS "./")
 
 # ============================================================

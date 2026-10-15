@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Waveshare ESP32-S3-RLCD-4.2  ——  联网气象时钟(深色版)
  *
  *  界面:  黑底白字 / 单色现代的极简布局
@@ -42,6 +42,7 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <esp_attr.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_netif.h>
@@ -52,6 +53,7 @@
 #include "audio_player.h"
 #include "battery.h"
 #include "ble_ctrl.h"
+#include "ble_gate.h"
 #include "net_audio.h"
 #include "sysmon.h"
 #include "ui_clock_bits.h"      /* 方块点阵时钟的数字字形(工具生成) */
@@ -62,6 +64,7 @@
 #include "wav_player.h"
 #include "user_app.h"
 #include "wifi_cfg_parse.h"
+#include "ui_weather_icons.h"   /* 天气图标位图,由 tools/fontgen 生成 */
 
 /* LCD 显存句柄(main.cpp 里的全局对象)。频谱要直接写显存,绕过 LVGL。 */
 extern DisplayPort RlcdPort;
@@ -120,6 +123,18 @@ static bool s_wifi_cfg_tried_sd = false;      /* 是否已经尝试过读卡 */
 /* 调试埋点:1 = 每秒打印刷新调度数据(定位时序问题用);0 = 关闭 */
 #define CLOCK_DBG_LOG         1
 
+/* 曲线页每次重绘打一行耗时。★ 它以前是唯一一个没有任何耗时统计的页面,
+   结果"这页重不重、该刷多快"全靠猜。
+   改成 1 秒刷之后这行也是 1 秒一条,和时钟页一样密;嫌串口吵就改成 0。 */
+#define CURVE_DBG_LOG         1
+
+/* 资源柱数值跟踪。调"柱子/数字不显示"时改成 1 —— 会把↓/↑两根柱
+   实际拿去画的那两个字符串打到串口(每秒一条)。
+   屏幕看不到的时候,这是唯一能确认"数据到没到绘图这一层"的手段。
+   ★ 2026-10 就是靠它定位到"数据每秒都在到,但 rt_ok 判据写成了
+     'TCP 是否连着',短连接下几乎永远是 0,所以屏上什么也不显示"。 */
+#define RESBAR_TRACE          0
+
 static const char *TAG = "clock";
 
 /* ==================== 界面状态 ====================
@@ -138,9 +153,15 @@ static const char *TAG = "clock";
  * 旁边只写数值 —— 单位靠 °C 和 % 两个符号表达,不写中文。
  *
  * 宽度都要卡死,因为两边都是靠视觉擦除框刷新的,压线就会互相擦:
- *   左数值框 32..89  ,离时钟白底(从 30 开始但只到 y=122)不冲突
- *   右数值框 306..368 ,同理
- * 竖向都在白底之下(基线 144),所以不会和网格撞上。
+ *   左数值框 32..84  ,右数值框 316..368 —— 关键是都要让开【日期行】。
+ *   ★ 日期是居中的(中心 200),最长那串 "2026年12月31日  星期三" 宽 228,
+ *     所以日期墨迹永远落在 86..313 这一段。数值框的擦除框是实心黑、
+ *     又是【后画】的(UpdateSideBars 跑在 RenderClockPage 之后),一旦咬进去
+ *     就会把日期两头的字啃掉一块 —— 实测正是"2026"的 2 少了左半边、
+ *     "星期四"的四少了右半边。
+ *     以前只按"别压到时钟白底"算过,而白底只到 y=122,数值框基线在 144,
+ *     根本不在同一行,所以这个撞车一直没被发现。
+ * 竖向都在时钟白底之下(基线 144),不会和网格撞上。
  */
 #define SIDE_W          24                   /* 柱宽(下面大柱是 32) */
 #define SIDE_H          74                   /* 柱高:从日期行上方一直填到第二根分隔线 */
@@ -155,11 +176,11 @@ static const char *TAG = "clock";
 
 #define SIDE_T_X        2                    /* 左柱(温度)左边:贴边 */
 #define SIDE_T_TXT_X    (SIDE_T_X + SIDE_W + 6)   /* 32 */
-#define SIDE_T_TXT_W    58                        /* 右边界 89,离时钟左边界 94 留 5px */
+#define SIDE_T_TXT_W    52                        /* 右边界 84:给日期行(86 起)留 2px */
 
 #define SIDE_H_X        (400 - 2 - SIDE_W)   /* 右柱(湿度)左边 = 374:贴边 */
 #define SIDE_H_TXT_R    (SIDE_H_X - 6)       /* 湿度数值框右边界 = 368 */
-#define SIDE_H_TXT_W    62                   /* 左边界 306,正好在时钟右边界 305 之外 */
+#define SIDE_H_TXT_W    52                   /* 左边界 316:给日期行(到 313)留 3px */
 
 /* AM/PM 从 12 小时制切回 24 时要擦这一块,所以位置必须写死;
    基线 60 -> 擦除区 y=43..65,正好避开分隔线(y=42)、
@@ -182,7 +203,8 @@ static char s_p_date[64]   = "";
 /* 实际生效的 IP(连上 WiFi 后才有值)。顶栏直接显示它,
    这样屏上的地址永远是真的在用的那个,不是写死的常量。 */
 static char s_ip_str[24]   = "";
-static char s_p_track[40]  = "";
+static char s_p_src[40]    = "";   /* 左上:当前频谱来源 */
+static char s_p_song[40]   = "";   /* 中间:当前曲名(只在本地播放源下非空) */
 static char s_p_mstate[32] = "";
 
 /* 纵轴刻度个数。位置固定 6 等分,数字随显示下限重写。 */
@@ -191,7 +213,7 @@ static float s_axis_floor = -55.0f;   /* 刻度当前反映的下限 */
 
 /* 频谱柱子仍然直接写显存(原因见文件头):
    只重画"高度变化的那几行",一帧不到 1000 个像素。 */
-static int  s_bar_h[SPECTRUM_BANDS] = {0};
+EXT_RAM_BSS_ATTR static int s_bar_h[SPECTRUM_BANDS] = {0};
 static bool s_bars_need_clear = true;
 
 /* 谁往显存里画就持这把锁。以前是 Lvgl_lock;LVGL 走了之后
@@ -212,6 +234,9 @@ static void DrawTextRightBox(int right_x, int baseline, int box_w,
                              const UiFont *f, const char *txt);
 static void DrawTextCenterBox(int center_x, int baseline, int box_w,
                               const UiFont *f, const char *txt);
+/* 定宽左对齐擦除版(定义在文件后半段,音乐页的刷新循环在它前面,得先声明) */
+static void DrawTextInBox(int x, int baseline, int box_w,
+                          const UiFont *f, const char *txt);
 static void DrawIpLabel(void);
 static void DrawSsidLabel(void);
 static void DrawClockIcon(bool synced);
@@ -222,6 +247,7 @@ static void DrawPlugIcon(bool external);
    时,新字只盖住右边一段,左边"麦克"两个字的笔画会留在屏上。
    宽度按各自最长的内容取。 */
 #define MSTATE_BOX_W   92    /* 最长是"麦克风频谱" 5 字 */
+#define SRC_BOX_W      68    /* 左上来源字定宽擦除,最长"来自本地/来自电脑" 4 字 */
 #define TRACK_BOX_W   180    /* 文件名按 %.20s 截,西文 20 字符约 160px */
 
 /* ---------- 频谱区几何 ----------
@@ -291,24 +317,29 @@ static void DrawDbGrid(void)
    而且长度不定(wifi.txt 里的名字可以很长),必须用定宽框擦。
    没连上就显示 "no wifi"。 */
 #define SSID_TXT_X      2
-#define SSID_BOX_W      62                    /* 7 个 ASCII 字符 */
+#define SSID_BOX_W      52                    /* 约 6 个 ASCII 字符。
+                                                原来是 62,腾出 10px 给天气图标 —— 
+                                                SSID 一般就四五个字母(这台是 "MIKU") */
 
-#define IP_TXT_X        70
+#define IP_TXT_X        64
 #define IP_BOX_W        148                   /* "192.168.1.182:3333" 18 字符 */
 
-#define BATT_ICON_X     224
+/* ★ 顶栏整体重排过(2026-10 加天气图标)。左边这一串统统左移,
+   右边空出来放天气 —— 而且所有间隔统一成 10px,以前是 6/6/8/10/7 不均,
+   远看就是"右边空着一大截"。 */
+#define BATT_ICON_X     222
 #define BATT_ICON_Y     13
 #define BATT_ICON_W     26                    /* 电池身体宽(不含右侧触点) */
 #define BATT_ICON_H     15
 #define BATT_ICON_R     3                     /* 圆角半径 */
 #define BATT_INSET      3                     /* 电量条距外框 */
-#define BATT_TXT_X      258
+#define BATT_TXT_X      261
 #define BATT_TXT_W      32
 
 /* TF 卡图标:照 Material Symbols / MDI 的 sd-card 形状画 ——
    正方形卡片轮廓 + 左上角斜切 + 卡内顶部 3 根竖触点。
    没插卡就整个不画(只把那块擦黑)。 */
-#define SD_ICON_X       320
+#define SD_ICON_X       326
 #define SD_ICON_Y       13
 #define SD_ICON_W       15
 #define SD_ICON_H       15
@@ -316,15 +347,23 @@ static void DrawDbGrid(void)
 /* 外接电源:插头图标(替掉原来"外接充电"4 个汉字)。
    注意它和电池图标里那个闪电分工不同:
    插头 = "插着外接电源",闪电 = "正在往里充"。 */
-#define PLUG_X          300
+#define PLUG_X          303
 #define PLUG_Y          13
 #define PLUG_W          13
 #define PLUG_H          15
 
 /* 时间同步状态:秒表图标,占 15px(原来是 84px 的文字) */
-#define CLK_ICON_X      381
+#define CLK_ICON_X      379
 #define CLK_ICON_Y      13
 #define CLK_ICON_R      6                     /* 表盘半径,直径 13 */
+
+/* 天气图标(室外天气,路由器推来的)。夹在 SD 卡和"已同步"秒表之间 ——
+   那块以前一直空着 46px,正是这次要填的地方。
+   18px 比其他顶栏图标(13~15px)略大:它旁边【没有文字】,
+   信息全压在图标本身,小了就看不出是晴还是雨。
+   尺寸 WX_ICON_W/H 来自生成的头文件。 */
+#define WX_ICON_X       351
+#define WX_ICON_Y       11                    /* 和旁边图标视觉中心对齐(y≈20) */
 
 /* ---- 固定 IP(可选)----
    为什么要固定:电脑端的推流程序要按地址连过来。走 DHCP 的话地址可能变,
@@ -389,11 +428,21 @@ static int           s_track_cnt  = 0;      /* 卡上有几个 WAV */
 static char          s_track_disp[28] = "无音乐文件";   /* 界面上显示的名字 */
 
 /* 从 TF 卡读出来的一块 PCM。放静态区,不压任务栈。 */
-static int16_t       s_pcm[MUSIC_CHUNK_BYTES / 2];
+EXT_RAM_BSS_ATTR static int16_t s_pcm[MUSIC_CHUNK_BYTES / 2];
 
 static float         s_temp      = 0.0f;
 static float         s_humi      = 0.0f;
 static bool          s_sensor_ok = false;
+
+/* ---- 天气(室外)。路由器按自己的 WAN IP 反查位置后取来推给板子的,
+   板子自己不联网 —— 为什么这么设计见 sysmon.h 的 wx_ok 那段。
+
+   新鲜度用的是 rt_ok(10 秒)而不是自己再记一个时间戳:
+   天气和路由器流量走【同一条 3335 流】,路由器一停两个一起失效,
+   没有必要维护第二套过期判据。 */
+static bool s_wx_ok   = false;      /* 有可用的天气数据 */
+static int  s_wmo     = -1;         /* WMO 天气码 */
+static int  s_wx_temp = 0;          /* 室外温度 °C */
 
 /* 顶栏两个指示器的数据源(SensorTask 每3秒刷一次) */
 static int           s_batt_level = 0;      /* 0~100 */
@@ -441,26 +490,28 @@ static Battery_Power s_power      = BATTERY_POWER_UNKNOWN;
    ★ 上下行必须分开给 —— 它们本来就不对称，用一个数的话
      要么下载一动就顶格，要么上传永远只有一丝。
 
-     下行 = 内网 2.5GbE。单位要注意:小工具推过来的数除过 1024，
-     是 KiB/s 而不是十进制的 KB/s，所以不能直接写 312500:
-         2.5Gbps / 8 = 312.5 MB/s(十进制)
-         312.5e6 / 1024 = 305175 KiB/s
-     满柱时屏上显示 305175/1024 = 298.0 MB/s —— 这里的 MB/s 也按 1024 算，
-     和“2.5G”的十进制定义差 2.4%，对柱高无所谓。
+   ★ 下行刻度 = 内网 2.5GbE。2026-10 一度改成宽带口径(61035),
+     用户确认保留 2.5G,又改回来了 —— 别再自作主张改回去。
+     单位:推过来的数除过 1024,是 KiB/s 不是十进制 KB/s,
+     所以不能直接写 312500 —— 2.5e9/8/1024 = 305175。
 
-     上行 = 宽带套餐 5 MB/s = 5000 KiB/s(如果以后换了套餐改这里) */
+     ⚠️ 但数据源是路由器 WAN，WAN 看不到内网那 2.5G 的流量。
+     用这个刻度时宽带跑满也只填柱子的一小截 —— 这是**故意**的，
+     好处是几 KB/s 的涓流不会被放大成一大截。
+
+     上行 = 宽带套餐 40 Mbps = 5 MB/s = 5000 KiB/s(换套餐改这里) */
 #define NET_FULL_DN_KBPS  305175
 #define NET_FULL_UP_KBPS    5000
 
 /* 网速显示的数值和单位都是自适应的:
-   低于 1024 KiB/s 用 KB/s(整数)，涓流也能看得见;
-   高了换 MB/s —— 2.5G 是 305175 KiB/s，6 位数在 40px 的文字框里放不下。
+   低于 1024 KiB/s 用 K，高了换 M —— 2.5G 是 305175 KiB/s，直接写出来
+   是 6 位数，40px 的文字框放不下。
    分界用 1024 不是 1000:数据本来就是按 1024 除过来的。 */
 
 /* 版本标记。改这块的排版就换个号。
    烧录后串口会打出来 —— 用来确定“板子上跑的到底是哪一版”，
    免得“改了但看起来没变”时分不清是没烧进去还是真没变。 */
-#define RESBAR_TAG "resbar-H9"
+#define RESBAR_TAG "resbar-H13"
 
 typedef struct {
     const char *title;              /* 静态的第一行,整页重画时画一次 */
@@ -1008,6 +1059,17 @@ static void SensorTask(void *arg)
         }
         s_sd_mounted = Sdcard_IsMounted();
 
+        /* 天气:和温湿度同一个节拍(3 秒)。天气 10 分钟才变一次,
+           没必要让界面每秒去问 sysmon。 */
+        {
+            SysStatus_t st;
+            Sysmon_GetStatus(&st);
+            bool ok = st.rt_ok && st.wx_ok;
+            s_wx_ok   = ok;
+            s_wmo     = ok ? st.wmo_code : -1;
+            s_wx_temp = st.out_temp;
+        }
+
         /* 每 60 秒体检一次(传感器本来就是 3 秒一轮)。
            放在这里而不是时钟任务里 —— 时钟任务只在时钟页干活,
            停在音乐页就永远看不到报告。 */
@@ -1115,7 +1177,7 @@ static void SpectrumTask(void *arg)
            放在 LVGL 锁外面 —— 读 I2S 会阻塞几到几十毫秒,不能占着锁做。 */
         if (s_spec_src == SRC_MIC) {
             Spectrum_Enable(true);      /* 暂停音乐时被关过,这里确保开着 */
-            static int16_t mic_buf[2048];
+            EXT_RAM_BSS_ATTR static int16_t mic_buf[2048];
             if (Audio_ReadMic(mic_buf, sizeof(mic_buf)) == ESP_OK) {
                 /* 头几次把原始波形统计打出来,确认 ES7210 真的在出数 */
                 static int probe = 0;
@@ -1161,7 +1223,8 @@ static void SpectrumTask(void *arg)
                 }
                 ESP_LOGI(TAG,
                          "[dbg] 源=%s 总=%.3f 峰值=%.1fdB @%uHz  top: %d=%.2f %d=%.2f %d=%.2f %d=%.2f %d=%.2f",
-                         s_spec_src == SRC_MIC ? "麦克风" : "音乐",
+                         s_spec_src == SRC_MIC    ? "麦克风" :
+                         s_spec_src == SRC_STREAM ? "电脑推流" : "音乐",
                          (double)Spectrum_GetLevel(),
                          (double)Spectrum_GetPeakDb(),
                          (unsigned)Spectrum_GetSampleRate(),
@@ -1172,15 +1235,32 @@ static void SpectrumTask(void *arg)
         }
 
         /* 麦克风模式要把显示下限拉深,否则远处的声音全被截成 0。
-           实测(34.5dB 增益、安静房间):麦克风的 FFT 峰值在 -58~-71dB,
-           平均约 -64dB —— 原来 -55dB 的下限等于把它整个滤掉了,
-           所以远一点就完全不动。取 -72dB 时噪声占屏幕约 10%,
-           而比噪声高 14dB 的声音能到 30% 左右,对比很清楚。
+           原来 -55dB 的下限等于把麦克风整个滤掉了,所以远一点就完全不动。
 
-           注意:光加模拟增益解决不了这个问题 —— 信号和噪声一起抬高,
-           信噪比没变。真正起作用的是这个显示下限。 */
+           ★ -70dB 这个值是实测定的,不是估的(2026-10):
+           安静房间里麦克风的噪声是【宽带】的,占 -72~-68dB;它【不是】
+           50Hz 电源哼声 —— 94~140Hz 反而是整条谱最干净的一段,隆起在
+           230~500Hz。噪声顶尖在 -68dB,主体压在 -70dB 以下。
+
+           映射是 lv = 1 + db/|floor|,改 floor 等于改纵轴总长度,所以
+           【不是】整体等比矮 2/72,而是只压底部、越往上越没影响:
+
+             db     -72dB下限   -70dB下限
+             -71       1.4%        0     ← 整个消失
+             -69       4.2%      1.4%
+             -68       5.6%      2.9%    ← 噪声峰,正好砍半
+             -60      16.7%     14.3%    ← 往下都看不出区别
+             -30      58.3%     57.1%
+              -5      93.1%     92.9%
+
+           噪声正好卡在这个拐点上,所以主体归零、只剩峰尖减半。
+           代价:比 -70dB 还轻的声音不可见 —— 但它们本来就埋在 -68dB 的
+           噪声里,看不看得见没区别。
+
+           和 spectrum.c 里逐段噪底扣除的分工:这一条是【立刻生效】的静态
+           粗调(那家伙要几十秒才收敛),那边管残余和随环境漂移的细调。 */
         {
-            float want = (s_spec_src == SRC_MIC) ? -72.0f : -55.0f;
+            float want = (s_spec_src == SRC_MIC) ? -70.0f : -55.0f;
             if (want != Spectrum_GetFloor()) {
                 Spectrum_SetFloor(want);
             }
@@ -1230,15 +1310,24 @@ static void SpectrumTask(void *arg)
                 DrawTextRightBox(398, 13 + ui_font_cjk16.base, MSTATE_BOX_W,
                                  &ui_font_cjk16, s_p_mstate);
             }
-            /* 中间这行写的是"现在这个频谱是从哪儿来的",跟着选中的来源走。
+            /* 左上这行写的是"现在这个频谱是从哪儿来的",跟着选中的来源走。
                它和右上角的状态字分的是两件事:
                状态字说"在不在放、放得对不对",这里说"看的是谁"。 */
-            const char *track =
+            const char *src =
                 (s_spec_src == SRC_STREAM) ? "来自电脑" :
                 (s_spec_src == SRC_MIC)    ? "麦克风"   : "来自本地";
-            if (Changed(s_p_track, sizeof(s_p_track), track)) {
+            if (Changed(s_p_src, sizeof(s_p_src), src)) {
+                DrawTextInBox(2, 13 + ui_font_cjk16.base, SRC_BOX_W,
+                              &ui_font_cjk16, s_p_src);
+            }
+            /* 中间腾出来放曲名 —— 但只在本机放歌时才写:
+               麦克风没有歌;电脑推流放的是电脑上的歌,板子根本不知道名字。
+               别的源下留着上一首的旧名字,会让人以为音乐还在放,所以留空。 */
+            const char *song =
+                (s_spec_src == SRC_PLAYBACK) ? s_track_disp : "";
+            if (Changed(s_p_song, sizeof(s_p_song), song)) {
                 DrawTextCenterBox(200, 13 + ui_font_cjk16.base, TRACK_BOX_W,
-                                  &ui_font_cjk16, s_p_track);
+                                  &ui_font_cjk16, s_p_song);
             }
 
             RlcdPort.RLCD_Display();
@@ -1272,14 +1361,35 @@ static bool WantPcAudio(void)
     return s_spec_src == SRC_STREAM;
 }
 
+/* BLE 网关每轮开扫之前会问一句“现在忙吗”,忙就跳过、不抢射频。
+   直接复用现成的判断:电脑正占着喇叭 = 在推流 = 射频最紧张的时候。
+   这一步让“听音乐”和“扫蓝牙”彻底错开,不用去做精细的占空比调参。 */
+static bool BleGateBusy(void)
+{
+    return NetAudio_IsStreaming();
+}
+
 /* 切换频谱来源。集中在一处改:除了 s_spec_src 自己,还要通知推流任务
    "现在轮到你喂频谱了吗" —— 三个来源同时往同一个 FFT 里灌数据的话,
    柱子会是三者的混合物,谁也看不准。 */
+static void SetSpecSource(int src);   /* 下面 TakePcAudio 要用,先声明 */
+
+/* net_audio 说"USB 那头开始推了,喇叭我拿走了" —— 界面跟着切到电脑推流。
+   走 SetSpecSource 而不是只改 s_spec_src:频谱开关、屏幕上的来源字
+   都要一起跟上,不然就是"看到的和听到的对不上"。 */
+static void TakePcAudio(void)
+{
+    if (s_spec_src != SRC_STREAM) {
+        SetSpecSource(SRC_STREAM);
+        ESP_LOGI(TAG, "USB 推流接管喇叭,频谱源自动切到电脑推流");
+    }
+}
+
 static void SetSpecSource(int src)
 {
     s_spec_src = ((src % SRC_COUNT) + SRC_COUNT) % SRC_COUNT;
     NetAudio_SetSpectrumEnabled(s_spec_src == SRC_STREAM);
-    ESP_LOGI(TAG, "频谱源 -> %s(松手定在这里)",
+    ESP_LOGI(TAG, "频谱源 -> %s",
              s_spec_src == SRC_MIC    ? "麦克风" :
              s_spec_src == SRC_STREAM ? "电脑推流" : "播放音乐");
 }
@@ -1460,6 +1570,7 @@ static void ButtonTask(void *arg)
                 /* 长按松手:源已经定下来了,收尾 ——
                    如果定的不是"电脑推流",就把播放通道从电脑手里要回来,
                    否则按 BOOT 根本放不了本地音乐(通道还在电脑那儿)。 */
+                ESP_LOGI(TAG, "松手,定在这里");
                 CommitSpecSource();
             }
         }
@@ -1718,21 +1829,44 @@ static void RoundFill(int x, int y, int w, int h, int r)
 
 /* ---------------- 竖向资源柱 ---------------- */
 
-/* 网速的"数值 + 单位"自适应格式化:低于 1024 KiB/s 用 KB/s(整数)，
-   高了换 MB/s 保留一位小数。
-   为什么必须分两档:固定 KB/s 时 2.5G 是 "305175"，6 位数在文字框里放不下;
-   固定 MB/s 时涓流又全变成 "0.0"。分界取 1024 不是 1000 —— 数据本来就
-   是按 1024 除过来的。
-   MB/s 用纯整数算，不碰 %f —— 万一 IDF 开了 newlib nano 格式，%f 会直接打不出来 */
-static void FmtSpeed(unsigned kbs, char *num, size_t num_cap, const char **unit)
+/* 网速的紧凑写法(柱子的第二行用):单位并进数值里。
+
+   为什么不像以前那样数值 / 单位分两行:第三行腾出来写累计总量了。
+
+   ★ 宽度上限是 5 个字符 —— 文字框 40px，14px 下 5 个字符刚好铺满，
+     "298.1M" 这种 6 字符会压到右边那根柱子上，所以 >=100 MB/s 时
+     砍掉小数变成 "298M"。FmtSpeedShort 没有这个上限，别混用。
+
+   分界取 1024 不是 1000 —— 路由器推过来的就是按 1024 除的。 */
+static void FmtSpeedTight(unsigned kbs, char *out, size_t cap)
 {
     if (kbs < 1024u) {
-        snprintf(num, num_cap, "%u", kbs);
-        *unit = "KB/s";
+        snprintf(out, cap, "%uK", kbs);
     } else {
         unsigned tenths = (kbs * 10u + 512u) / 1024u;      /* 0.1 MB，四舍五入 */
-        snprintf(num, num_cap, "%u.%u", tenths / 10u, tenths % 10u);
-        *unit = "MB/s";
+        if (tenths < 1000u) {
+            snprintf(out, cap, "%u.%uM", tenths / 10u, tenths % 10u);
+        } else {
+            snprintf(out, cap, "%uM", tenths / 10u);
+        }
+    }
+}
+
+/* 累计流量的紧凑写法(柱子的第三行用):输入 MiB，输出 "512M" / "2.9G" / "1.2T"。
+
+   ★ 路由器推的是 MiB 而不是字节：字节数 32 位放不下(5TB 就溢出)，
+     板子这边 atoi 也会直接给个假数。
+   ★ 同样限 5 个字符。TB 那一档必须用 64 位算，mib 本身就能到 2^32。 */
+static void FmtTotal(unsigned mib, char *out, size_t cap)
+{
+    if (mib < 1024u) {
+        snprintf(out, cap, "%uM", mib);
+    } else if (mib < 1048576u) {
+        unsigned tenths = (mib * 10u + 512u) / 1024u;      /* 0.1 GB */
+        snprintf(out, cap, "%u.%uG", tenths / 10u, tenths % 10u);
+    } else {
+        unsigned tenths = (unsigned)(((uint64_t)mib * 10u + 524288u) / 1048576u);
+        snprintf(out, cap, "%u.%uT", tenths / 10u, tenths % 10u);
     }
 }
 
@@ -1802,18 +1936,24 @@ static void DrawSideBar(int bx, int pct)
     }
 }
 
-/* 时钟两侧的两根小柱:左温度、右湿度。
-   温度按 0~50°C 折成柱高,湿度本来就是 0~100%。
-   数值没变就不重画(传感器 3 秒才读一次,时钟每秒都刷,不挡一下就白刷)。
+/* 时钟两侧的两根小柱:左【室外天气温度】、右湿度。
+   ★ 左边这根 2026-10 改过数据来源:以前显示 SHTC3 的室内温度,
+     现在显示路由器推来的室外天气温度(用户要求"室内温度停用")。
+     位置、柱高画法、数字格式全都没变,只是换了数据源。
+     室内温度不再上屏 —— 想让两个都显示的话得另找地方,顶栏已经满了。
+   柱高仍是 0~50°C 折满,低于 0°C 会被压到 0(数字照实显示负数)。
+   数值没变就不重画(时钟每秒都刷,不挡一下就白刷)。
    force = 整页刚清成黑的,必须无条件全画。 */
 static void UpdateSideBars(bool force)
 {
     static int last_t = -9999;
     static int last_h = -9999;
     char txt[16];
-    int  t  = (int)(s_temp + (s_temp >= 0.0f ? 0.5f : -0.5f));
     int  h  = (int)(s_humi + 0.5f);
     int  tp;
+    /* -999 = 没天气数据(路由器没在推)。用远离正常温度的哨兵值,
+       比用 0 好 —— 0°C 是个真实温度,不能当"无数据" */
+    int  t  = s_wx_ok ? s_wx_temp : -999;
 
     if (!force && t == last_t && h == last_h) {
         return;
@@ -1821,13 +1961,21 @@ static void UpdateSideBars(bool force)
     last_t = t;
     last_h = h;
 
-    /* ---- 左:温度。° 写成 UTF-8 的 C2 B0,并和 "C" 拼开 ——
+    /* ---- 左:室外天气温度。° 写成 UTF-8 的 C2 B0,并和 "C" 拼开 ——
        不拼开的话 \xB0C 会被当成一个十六进制转义( C 也是十六进制数字) ---- */
-    tp = (int)((float)t / SIDE_TEMP_FULL * 100.0f + 0.5f);
-    DrawSideBar(SIDE_T_X, tp);
-    snprintf(txt, sizeof(txt), "%d\xC2\xB0" "C", t);
-    DrawTextInBox(SIDE_T_TXT_X, SIDE_TXT_B, SIDE_T_TXT_W,
-                  &ui_font_ascii14, txt);
+    if (t <= -999) {
+        DrawSideBar(SIDE_T_X, 0);           /* 没数据:柱空着 + "--" */
+        DrawTextInBox(SIDE_T_TXT_X, SIDE_TXT_B, SIDE_T_TXT_W,
+                      &ui_font_ascii14, "--");
+    } else {
+        tp = (int)((float)t / SIDE_TEMP_FULL * 100.0f + 0.5f);
+        if (tp < 0)   tp = 0;
+        if (tp > 100) tp = 100;
+        DrawSideBar(SIDE_T_X, tp);
+        snprintf(txt, sizeof(txt), "%d\xC2\xB0" "C", t);
+        DrawTextInBox(SIDE_T_TXT_X, SIDE_TXT_B, SIDE_T_TXT_W,
+                      &ui_font_ascii14, txt);
+    }
 
     /* ---- 右:湿度 ---- */
     DrawSideBar(SIDE_H_X, h);
@@ -1894,10 +2042,18 @@ static void DrawVBarDynamic(int k, const SysStatus_t *st, bool ok, bool force)
             DrawTextInBox(tx, VBAR_L3_B, VBAR_TXT_W, &ui_font_ascii14, c->l3);
         }
     } else {
-        /* ---- 后两根:↓ 下载 / ↑ 上传。值换算成 MB/s,单位与数值都自适应 ---- */
-        unsigned kbs  = ok ? (k == 3 ? st->down_kbps : st->up_kbps) : 0;
+        /* ---- 后两根:↓ 下载 / ↑ 上传。
+               数据来自【路由器】(3335)，不是 PC 的网卡 —— 路由器 7x24
+               开着，PC 关了这两根柱也照样有数。
+                 第二行 = 实时速度  (436K / 2.5M)
+                 第三行 = 累计总量  (2.9G / 139M)
+               口径 = pppoe-wan 自拨号以来累计，重拨会归零。
+
+               以前是"数值 + 单位"分两行，现在单位并进数值里，
+               把第三行腾给累计总量 —— 横向布局一个像素都没动。 ---- */
+        unsigned kbs  = st->rt_ok ? (k == 3 ? st->rt_ds_kbps : st->rt_us_kbps) : 0;
         unsigned full = (k == 3) ? NET_FULL_DN_KBPS : NET_FULL_UP_KBPS;
-        const char *unit;
+        unsigned mib  = (k == 3) ? st->rt_dn_mib : st->rt_up_mib;
 
         /* 上限卡住:既防 kbs*10 溢出，也防数字跑出文字框 */
         if (kbs > 999999u) {
@@ -1916,21 +2072,25 @@ static void DrawVBarDynamic(int k, const SysStatus_t *st, bool ok, bool force)
             }
         }
 
-        /* MB/s 保留一位小数。纯整数运算，不碰 %f ——
-           万一 IDF 开了 newlib nano 格式，%f 会直接打不出来 */
-        if (ok) {
-            FmtSpeed(kbs, buf, sizeof(buf), &unit);
+        /* 纯整数运算，不碰 %f —— 万一 IDF 开了 newlib nano 格式，
+           %f 会直接打不出来 */
+        if (st->rt_ok) {
+            FmtSpeedTight(kbs, buf, sizeof(buf));
         } else {
             snprintf(buf, sizeof(buf), "-");
-            unit = "KB/s";
         }
         if (force || strcmp(c->l2, buf) != 0) {
             snprintf(c->l2, sizeof(c->l2), "%.11s", buf);
             DrawTextInBox(tx, VBAR_L2_B, VBAR_TXT_W, VBAR_NUM_FONT, c->l2);
         }
 
-        if (force || strcmp(c->l3, unit) != 0) {
-            snprintf(c->l3, sizeof(c->l3), "%.11s", unit);
+        if (st->rt_ok) {
+            FmtTotal(mib, buf, sizeof(buf));
+        } else {
+            snprintf(buf, sizeof(buf), "--");
+        }
+        if (force || strcmp(c->l3, buf) != 0) {
+            snprintf(c->l3, sizeof(c->l3), "%.11s", buf);
             DrawTextInBox(tx, VBAR_L3_B, VBAR_TXT_W, &ui_font_ascii14, c->l3);
         }
     }
@@ -1948,18 +2108,46 @@ static void UpdateResBars(bool force)
     SysStatus_t st;
     bool ok = Sysmon_IsConnected();
 
-    if (ok) {
-        Sysmon_GetStatus(&st);
-    } else {
-        /* PC 没接上来:显示 0 和 --，不把上一次的旧值留在屏上冒充实时数据 */
-        memset(&st, 0, sizeof(st));
+    /* ★ 无条件取一次:↓/↑ 那两根柱的数据来自路由器，不来自 PC。
+       PC 断了也要照常刷 —— 这正是"显示不依赖 PC"的关键。 */
+    Sysmon_GetStatus(&st);
+
+    if (!ok) {
+        /* PC 没接上来:CPU/GPU/内存显示 0 和 --，不把上一次的旧值留在屏上
+           冒充实时数据。
+           ★ 不能 memset 整个结构 —— 那会把路由器刚推来的数一起清掉，
+             记得到时把 pc 那几个字段逐个清就行。 */
+        st.cpu  = 0;
+        st.gpu  = 0;
+        st.ram  = 0;
         st.cput = -1;
         st.gput = -1;
+        st.ram_used_mb  = 0;
+        st.ram_total_mb = 0;
     }
 
     for (int k = 0; k < VBAR_N; k++) {
         DrawVBarDynamic(k, &st, ok, force);
     }
+
+#if RESBAR_TRACE
+    {
+        char d2[16], d3[16], u2[16], u3[16];
+        if (st.rt_ok) {
+            FmtSpeedTight(st.rt_ds_kbps, d2, sizeof(d2));
+            FmtTotal(st.rt_dn_mib, d3, sizeof(d3));
+            FmtSpeedTight(st.rt_us_kbps, u2, sizeof(u2));
+            FmtTotal(st.rt_up_mib, u3, sizeof(u3));
+        } else {
+            snprintf(d2, sizeof(d2), "%s", "-");
+            snprintf(d3, sizeof(d3), "%s", "--");
+            snprintf(u2, sizeof(u2), "%s", "-");
+            snprintf(u3, sizeof(u3), "%s", "--");
+        }
+        ESP_LOGI(TAG, "[rt] pc_ok=%d rt_ok=%d  下行 %s / %s   上行 %s / %s",
+                 (int)ok, (int)st.rt_ok, d2, d3, u2, u3);
+    }
+#endif
 }
 
 /* 充电时电池里那个小闪电,7 宽 x 9 高 */
@@ -2120,6 +2308,24 @@ static void DrawPlugIcon(bool external)
     Ui_FillRect(bx + 5, by + 10, 3, 5, 1);
 }
 
+/* 天气图标。idx < 0 = 没数据,那块就空着 ——
+   和 TF 卡"没插卡不画"、插头"没接外接不画"是同一套视觉语言:
+   空着比画个问号好认。 */
+static void DrawWeatherIcon(int idx)
+{
+    Ui_FillRect(WX_ICON_X, WX_ICON_Y, WX_ICON_W, WX_ICON_H, 0);
+    if (idx < 0 || idx >= WX_ICON_COUNT) {
+        return;
+    }
+    for (int y = 0; y < WX_ICON_H; y++) {
+        for (int x = 0; x < WX_ICON_W; x++) {
+            if (kWeatherIcon[idx][y][x >> 3] & (1u << (x & 7))) {
+                Ui_Pixel(WX_ICON_X + x, WX_ICON_Y + y, 1);
+            }
+        }
+    }
+}
+
 /* 画顶栏那几个指示器。force=true 时无条件重画 —— 整页重绘之后必须传 true,
    因为整个屏幕刚被清成黑的,而函数内部的"内容没变就不画"会把它漏掉。 */
 static void DrawTopIndicators(bool force)
@@ -2128,15 +2334,17 @@ static void DrawTopIndicators(bool force)
     static bool          last_has = false;
     static bool          last_sd  = false;
     static Battery_Power last_pwr = BATTERY_POWER_UNKNOWN;
+    static int           last_wx  = -99;
     static bool          started  = false;
 
     int           lvl = s_batt_ok ? s_batt_level : -1;
     bool          has = s_batt_ok;
     bool          sd  = s_sd_mounted;
     Battery_Power pwr = s_power;
+    int           wx  = s_wx_ok ? Weather_IconForWmo(s_wmo) : -1;
 
     if (!force && started && lvl == last_lvl && has == last_has &&
-        sd == last_sd && pwr == last_pwr) {
+        sd == last_sd && pwr == last_pwr && wx == last_wx) {
         return;
     }
     started  = true;
@@ -2144,6 +2352,7 @@ static void DrawTopIndicators(bool force)
     last_has = has;
     last_sd  = sd;
     last_pwr = pwr;
+    last_wx  = wx;
 
     /* ---- 电池(充电时里面画闪电) ---- */
     DrawBatteryIcon(BATT_ICON_X, BATT_ICON_Y, lvl,
@@ -2165,6 +2374,9 @@ static void DrawTopIndicators(bool force)
 
     /* ---- TF 卡(没卡就不画;DrawSdIcon 会先把那块擦黑) ---- */
     DrawSdIcon(SD_ICON_X, SD_ICON_Y, sd);
+
+    /* ---- 室外天气图标 ---- */
+    DrawWeatherIcon(wx);
 }
 
 /* ---------------- 页 0:时钟 ---------------- */
@@ -2223,12 +2435,14 @@ static void RenderMusicPage(void)
 {
     Ui_Clear(0);
 
-    DrawText(2, 7 + ui_font_cjk20.base, &ui_font_cjk20,
-             "音乐播放", -1, true);
+    /* 左上角原来是页面标题"音乐播放" —— 这一页本来就是音乐页,标题是废话。
+       腾出来的位置改放"当前频谱来源",中间放曲名(见 SpectrumTask 里的更新逻辑)。 */
+    DrawTextInBox(2, 13 + ui_font_cjk16.base, SRC_BOX_W,
+                  &ui_font_cjk16, s_p_src);
     DrawTextRightBox(398, 13 + ui_font_cjk16.base, MSTATE_BOX_W,
                      &ui_font_cjk16, s_p_mstate);
     DrawTextCenterBox(200, 13 + ui_font_cjk16.base, TRACK_BOX_W,
-                      &ui_font_cjk16, s_p_track);
+                      &ui_font_cjk16, s_p_song);
 
     DrawDivider(38);
 
@@ -2320,10 +2534,18 @@ static void RenderMusicPage(void)
  *       那层浅填充看着好看,但在单色屏上就是一整块白;只有做成
  *       "从底边填到数值高度"的柱子,才能既看出趋势又看出绝对量。
  *       顺便和频谱页是同一个路子
+ *    5) 只画【最近 78 秒】—— 正好等于柱数(78),一根柱子代表 1 秒。
+ *       X 轴左端固定是"78 秒前",柱子间距也固定 —— 时间轴不会随着
+ *       "数据越攒越多"而伸缩,看趋势时就不会被"新点把旧点挤成一根针"
+ *       干扰。开机不满 78 秒时左端刻度照实写成 5s / 42s 这样,
+ *       不假装自己有 78 秒的数据
  *  量程照参考设计:百分比固定 0~100(四张图能横向比),
  *  只有网速按窗口内最大值自适应 —— 否则涓流和 2.5G 没法画在一起。
- *  网速那张画的是"窗口内上下行的包络"(取两者较大者),不是两组柱子:
- *  真要分开就得再引入点/线区分,而主界面那两根柱子已经分别显示 ↓↑ 了。
+ *  网速那张是【镜像双序列】:中线当零点,上半画下行、下半画上行。
+ *  上下各用各的量程 —— 家宽下行动辄是上行的几十上百倍,共用一个量程
+ *  的话下半张会塌成贴着中线的直线,拆开也白拆。代价是两半的柱子高度
+ *  【不能直接比大小】,所以上下各标各的刻度值,别拿柱子长度互相比。
+ *  (改动前是"取上下行较大者的包络"——那样只看得出下行,上行的形状全被吃掉)
  */
 
 #define SYS_M        2                      /* 面板区外边距:四边都只留 2px,吃满屏 */
@@ -2361,12 +2583,23 @@ static void RenderMusicPage(void)
 /* 步距 = 柱 1 + 缝 1。全都紧挨着的话填出来是一整块实心面,
    根本看不出"一根根柱子" —— 频谱之所以像柱子,也是因为有缝 */
 #define SYS_BAR_STEP 2
-#define SYS_NBAR      (SYS_PLOT_W / SYS_BAR_STEP)   /* 一张图 83 根 */
-#define SYS_TITLE_W  56                     /* 最宽的是 "MEM %"(52px) */
+#define SYS_NBAR      (SYS_PLOT_W / SYS_BAR_STEP)   /* 一张图 78 根 */
+/* ★ 只显示最近 SYS_NBAR 秒 —— 也就是【柱数】。一根柱子代表 1 秒,而刷新
+   也是 1 秒一次,两下一对:每刷一次正好往左滚一根,屏幕上有多少根柱子
+   就显示多少秒。0.5 秒一个原始点,78 秒 = 156 个原始点摊到 78 根柱子上,
+   一根正好 1 秒。
+   sysmon 那边缓冲存多长就是照这个数配的(SYSMON_HIST_MAX),两边配套:
+   改这里【必须】一起看那里 —— 不然缓冲装不下,曲线左端会莫名其妙短一截。 */
+#define SYS_WINDOW_S  (SYS_NBAR)            /* 78 秒 = 柱数 */
+#define SYS_TITLE_W  66                     /* 最宽的是 "NET↓↑"(约 56px),留点余量 */
 #define SYS_VAL_W    56                     /* 最宽的是 "976.6M"(49px) */
 
 static const char *kSysName[SYS_N] = {
-    "CPU %", "GPU %", "MEM %", "NET↓"
+    "CPU %", "GPU %", "MEM %",
+    /* 拆成上下两半了,所以标题两个箭头都写 —— 只写 ↓ 会让人以为
+       下半张画的是别的东西。↑↓ 都在 ui_font_ascii14 里(见 gen_ui_font.py
+       的 SYMBOLS),不会变成方块 */
+    "NET↓↑"
 };
 
 /* 点状线。1bpp 没有"半透明",隔四个点打一个点来模拟参考图里的淡网格 */
@@ -2408,9 +2641,14 @@ static void FmtSpan(int secs, char *out, size_t cap)
 /* 画一张子图。
    val[] 是 n 个采样,-1 = 该点没数据(那一根留空)。
    scale 是量程,span_s 是这段历史覆盖的秒数(X 轴刻度用)。
-   Y 轴刻度:百分比那三张固定 0/50/100,网速那张跟着自适应量程走 */
-static void DrawSysPanel(int k, const int *val, int n, int scale, int span_s,
-                         const char *cur_txt)
+   Y 轴刻度:百分比那三张固定 0/50/100。
+
+   ★ val2 != NULL 时画【镜像双序列】(只给网速那张用):
+     以绘图区中线为零点,上半画 val(下行)、下半画 val2(上行),
+     val2 的量程是 scale2。两条各用各的尺子,理由见 RenderSysPage。
+     只给网速用,是因为只有它一个概念天然有"两个方向"。*/
+static void DrawSysPanel(int k, const int *val, const int *val2, int n,
+                         int scale, int scale2, int span_s, const char *cur_txt)
 {
     const int px = SYS_COL_X(k % 2);
     const int py = SYS_ROW_Y(k / 2);
@@ -2419,11 +2657,13 @@ static void DrawSysPanel(int k, const int *val, int n, int scale, int span_s,
     const int gw = SYS_PLOT_W;
     const int gh = SYS_PLOT_H;
     const int bot = gy + gh - 1;            /* 绘图区底边 = 量程 0 的位置 */
+    const int mid = gy + gh / 2;            /* 绘图区中线 = 镜像模式零点 */
     const int ax  = gx - 1;                 /* Y 轴轴线 */
+    const bool mirror = (val2 != NULL);
     const int lab_r = px + SYS_GUT_X + SYS_GUT_W;   /* 刻度值框右边界 */
     /* lab 要能装下 "-" + xl(最多 11 字符) + '\0' = 13 字节,
        所以不能跟 xl/xm 一样是 12 */
-    char yhi[12], ymid[12], xl[12], xm[12], lab[16];
+    char yhi[12], ymid[12], ylo[12], xl[12], xm[12], lab[16];
 
     RoundFrame(px, py, SYS_W, SYS_H, 4);
 
@@ -2435,21 +2675,25 @@ static void DrawSysPanel(int k, const int *val, int n, int scale, int span_s,
                      &ui_font_ascii14, cur_txt);
 
     /* ---- Y 轴刻度值 ---- */
-    if (k == SYS_N - 1) {
-        /* 网速量程是自适应的,刻度就得跟着量程走,否则这刻度是假的。
-           这里用不带小数的极短写法 —— 刻度栏比完整的 "976.6M" 窄 */
-        FmtSpeedTiny((unsigned)scale, yhi, sizeof(yhi));
-        FmtSpeedTiny((unsigned)(scale / 2), ymid, sizeof(ymid));
+    if (mirror) {
+        /* 上 = 下行的量程,中 = 0(两半共用的零点),下 = 上行的量程。
+           网速量程是自适应的,刻度就得跟着量程走,否则这刻度是假的;
+           用不带小数的极短写法 —— 刻度栏(30px)比完整的 "976.6M" 窄。
+           ★ 上下两个数不一样是【故意的】,别当成写错了 */
+        FmtSpeedTiny((unsigned)scale,  yhi, sizeof(yhi));
+        FmtSpeedTiny((unsigned)scale2, ylo, sizeof(ylo));
+        snprintf(ymid, sizeof(ymid), "0");
     } else {
         snprintf(yhi, sizeof(yhi), "100");
         snprintf(ymid, sizeof(ymid), "50");
+        snprintf(ylo, sizeof(ylo), "0");
     }
 
     /* 10px 的数字墨迹大致是 baseline-7..baseline+1,想让它的中心落在
        刻度线上,基线取 y+3 */
     DrawTextRightBox(lab_r, gy + 3, SYS_GUT_W, &ui_font_ascii10, yhi);
     DrawTextRightBox(lab_r, gy + gh / 2 + 3, SYS_GUT_W, &ui_font_ascii10, ymid);
-    DrawTextRightBox(lab_r, bot + 3, SYS_GUT_W, &ui_font_ascii10, "0");
+    DrawTextRightBox(lab_r, bot + 3, SYS_GUT_W, &ui_font_ascii10, ylo);
 
     /* ---- 刻度短线 + L 形轴线 ---- */
     for (int i = 0; i <= 2; i++) {
@@ -2497,10 +2741,57 @@ static void DrawSysPanel(int k, const int *val, int n, int scale, int span_s,
         if (y > bot) {
             y = bot;                    /* 和上面的刻度短线用同一套坐标 */
         }
-        DotLine(1, ax, y, gw + 1);
+        /* 镜像那张的中线是【零点分界】,画成实线 —— 点状线夹在上下两半
+           的柱子中间,会被当成一条不起眼的网格而看不出它是轴 */
+        if (mirror && y == mid) {
+            Ui_HLine(ax, y, gw + 1, 1);
+        } else {
+            DotLine(1, ax, y, gw + 1);
+        }
     }
 
-    if (n < 1 || scale <= 0) {
+    if (n < 1 || scale <= 0 || (mirror && scale2 <= 0)) {
+        return;
+    }
+
+    if (mirror) {
+        /* ---- 镜像双序列 ----
+           上半(下行)从中线往上长,下半(上行)从中线往下长。
+           两半各占 40px(mid 上下一格),合起来正好填满 81px 的绘图区,
+           不会压到边框 —— 上半占 mid-40..mid,下半占 mid+1..mid+40=bot。
+           "有量就至少 2px" 的规则两边都保留:看得见比精确更重要。 */
+        const int half = gh / 2 - 1;
+
+        for (int i = 0; i < n; i++) {
+            int v, hgt, x;
+            if (val[i] < 0) {
+                continue;
+            }
+            v = val[i] > scale ? scale : val[i];
+            hgt = v * half / scale;
+            if (val[i] > 0 && hgt < 2) {
+                hgt = 2;
+            }
+            x = gx + i * SYS_BAR_STEP;
+            for (int b = 0; b < SYS_BAR_W; b++) {
+                Ui_VLine(x + b, mid - hgt, hgt + 1, 1);
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            int v, hgt, x;
+            if (val2[i] < 0) {
+                continue;
+            }
+            v = val2[i] > scale2 ? scale2 : val2[i];
+            hgt = v * half / scale2;
+            if (val2[i] > 0 && hgt < 2) {
+                hgt = 2;
+            }
+            x = gx + i * SYS_BAR_STEP;
+            for (int b = 0; b < SYS_BAR_W; b++) {
+                Ui_VLine(x + b, mid + 1, hgt, 1);
+            }
+        }
         return;
     }
 
@@ -2526,11 +2817,12 @@ static void DrawSysPanel(int k, const int *val, int n, int scale, int span_s,
 
 static void RenderSysPage(void)
 {
-    static SysSample_t dec[SYS_NBAR];       /* 降采样后的历史,四张图共用 */
-    static int         val[SYS_NBAR];
+    EXT_RAM_BSS_ATTR static SysSample_t dec[SYS_NBAR];       /* 降采样后的历史,四张图共用 */
+    EXT_RAM_BSS_ATTR static int val[SYS_NBAR];
+    EXT_RAM_BSS_ATTR static int val2[SYS_NBAR];   /* 网速那张的第二个序列:上行 */
     char  cur[24];
     char  buf[32];
-    int   n, net_max = 1, span_s;
+    int   n, net_dn = 1, net_up = 1, span_s, win_pts;
     SysStatus_t st;
 
     Ui_Clear(0);
@@ -2545,21 +2837,38 @@ static void RenderSysPage(void)
        被横穿(旧的 42 正好切在面板上) */
     DrawDivider(26);
 
-    /* 取一次历史就够四张图用 —— 降采样只和"图有多宽"有关,
-       和历史里存了几千个点无关 */
-    n = Sysmon_GetDecimated(dec, SYS_NBAR);
+    /* 先取状态:窗口要多大得用实测采样间隔来算 */
     Sysmon_GetStatus(&st);
 
-    /* 右上角标实际时间跨度。开机没多久时这个数会远小于 3 小时,照实显示。
-       ★ 时间跨度 = 原始点数 x 采样间隔,两个坑都在这一行里:
-         1) 不能用"柱数 n"乘 —— n 是降采样后的柱数(83),而 sample_ms 是
-            原始采样间隔,一个柱子平均覆盖几十个原始点,乘出来差几十倍;
+    /* ★ 窗口 = 最新 SYS_WINDOW_S 秒对应多少个【原始】点。
+       必须用 sample_ms 算,不能写死 0.5 秒 —— PC 推得快慢会变,
+       写死的话"78 秒"会跟着变成 60 秒或者 100 秒。
+       样本还不够 78 秒时,win_pts 比历史还长,decimate 内部会退化成
+       "取全部",所以开机头一分多钟也是正常的。 */
+    win_pts = (st.sample_ms > 0)
+            ? (int)((int64_t)SYS_WINDOW_S * 1000 / st.sample_ms)
+            : 0;
+
+    /* 取一次历史就够四张图用 —— 降采样只和"图有多宽"有关,
+       和历史里存了几千个点无关 */
+    n = Sysmon_GetDecimatedWindow(dec, SYS_NBAR, win_pts);
+
+    /* 右上角标【窗口内】实际时间跨度:数据超过 78 秒就恒为 1m,
+       不满 78 秒时照实显示(12s / 45s),不假装自己有 78 秒的数据。
+       ★ 时间跨度 = 原始点数 x 采样间隔,三个坑都挤在这一处:
+         1) 不能用"柱数 n"乘 —— n 是降采样后的柱数(78),而 sample_ms 是
+            原始采样间隔,一个柱子平均覆盖好几个原始点,乘出来差几倍;
          2) 必须先乘后除。写成 sample_ms / 1000 * hist_count 的话,
             500/1000 在整数除法下直接是 0,于是整个跨度恒为 0 ——
-            X 轴三个刻度就会全变成 "-0s"。 */
-    span_s = (st.sample_ms > 0 && st.hist_count > 1)
-           ? (int)((int64_t)st.sample_ms * st.hist_count / 1000)
-           : 0;
+            X 轴三个刻度就会全变成 "-0s";
+         3) 现在还要跟窗口取小:历史攒过 78 秒以后,左端是"78 秒前"
+            而不是"最旧那个点",不减的话刻度会把 78 秒写成 1m,和图对不上。 */
+    {
+        int span_all = (st.sample_ms > 0 && st.hist_count > 1)
+                     ? (int)((int64_t)st.sample_ms * st.hist_count / 1000)
+                     : 0;
+        span_s = (span_all > SYS_WINDOW_S) ? SYS_WINDOW_S : span_all;
+    }
     if (span_s > 0) {
         FmtSpan(span_s, buf, sizeof(buf));
     } else {
@@ -2572,8 +2881,8 @@ static void RenderSysPage(void)
         int64_t t = esp_timer_get_time();
         if (t - last_us > 10 * 1000000) {
             last_us = t;
-            ESP_LOGI(TAG, "曲线跨度 %ds = %d 个原始点 x %dms",
-                     span_s, st.hist_count, st.sample_ms);
+            ESP_LOGI(TAG, "曲线跨度 %ds(窗口 %d 点)= 历史 %d 点 x %dms",
+                     span_s, win_pts, st.hist_count, st.sample_ms);
         }
     }
     /* 右边这个时间跨度标签跟着页头一起上移。这里不跟页头"墨迹顶齐平",
@@ -2587,41 +2896,48 @@ static void RenderSysPage(void)
         return;
     }
 
-    /* 网速量程自适应:取窗口内上下行两个方向的最大值 */
+    /* 网速量程自适应:上下行【各算各的】最大值 */
     for (int i = 0; i < n; i++) {
-        if (dec[i].down > net_max) {
-            net_max = dec[i].down;
+        if (dec[i].down > net_dn) {
+            net_dn = dec[i].down;
         }
-        if (dec[i].up > net_max) {
-            net_max = dec[i].up;
+        if (dec[i].up > net_up) {
+            net_up = dec[i].up;
         }
     }
     for (int k = 0; k < SYS_N; k++) {
         int num, scale = 100;
+        const int *v2 = NULL;           /* 第二个序列:只有网速那张有 */
+        int s2 = 0;
 
         for (int i = 0; i < n; i++) {
             switch (k) {
             case 0:  num = dec[i].cpu;                                  break;
             case 1:  num = dec[i].gpu;                                  break;
             case 2:  num = dec[i].ram;                                  break;
-            default: num = dec[i].down > dec[i].up ? dec[i].down
-                                                  : dec[i].up;          break;
+            default: num = dec[i].down;                                 break;
             }
             val[i] = num;
         }
 
         /* 右上角的当前值。网速用紧凑写法,不然框里放不下 */
         if (k == SYS_N - 1) {
-            /* 标题已经写了 NET↓,这里的值就不再加箭头了 */
+            /* 下半张画上行。这里只放得下一个数字,所以给的是下行 ——
+               上行的当前值看主页面那两根柱子,不在这儿重复 */
+            for (int i = 0; i < n; i++) {
+                val2[i] = (int)dec[i].up;
+            }
+            v2    = val2;
+            s2    = net_up;
+            scale = net_dn;
             FmtSpeedShort((unsigned)dec[n - 1].down, cur, sizeof(cur));
-            scale = net_max;
         } else if (val[n - 1] < 0) {
             snprintf(cur, sizeof(cur), "--");
         } else {
             snprintf(cur, sizeof(cur), "%d", val[n - 1]);
         }
 
-        DrawSysPanel(k, val, n, scale, span_s, cur);
+        DrawSysPanel(k, val, v2, n, scale, s2, span_s, cur);
     }
 }
 
@@ -2633,15 +2949,25 @@ static void CurveTask(void *arg)
     for (;;) {
         if (s_page == PAGE_SYS && DispLock(200)) {
             s_sys_refresh = false;
+#if CURVE_DBG_LOG
+            int64_t t0 = esp_timer_get_time();
+#endif
             RenderSysPage();
-            RlcdPort.RLCD_Display();        /* 六张图一起推一次屏 */
+            RlcdPort.RLCD_Display();        /* 四张图一起推一次屏 */
             DispUnlock();
+#if CURVE_DBG_LOG
+            /* 计时放在解锁之后:往串口写日志可能阻塞,不该占着显示锁 */
+            ESP_LOGI(TAG, "[dbg] 曲线刷新耗时=%dms",
+                     (int)((esp_timer_get_time() - t0) / 1000));
+#endif
         }
 
-        /* 平时 2 秒一次(时钟页是 1 秒)。曲线页要重绘六张图和网格,
-           比时钟页重得多,没必要刷那么勤。切成 100ms 的小步是为了
-           长按 KEY 时能马上响应,不用等满 2 秒 */
-        for (int i = 0; i < 20 && !s_sys_refresh; i++) {
+        /* 平时 1 秒一次(和时钟页一样)。这个节奏是配着柱子密度定的:
+           数据本身 0.5 秒一个点,所以 1 秒刷新 = 每次多 2 个点;
+           而一根柱子正好代表 1 秒 —— 刷新节奏和数据节奏是对上的,
+           每刷一次图表就往左滚一根柱子。再快就只是把同一批数据重画一遍。
+           切成 100ms 的小步是为了长按 KEY 时能马上响应,不用等满 1 秒 */
+        for (int i = 0; i < 10 && !s_sys_refresh; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         s_sys_refresh = false;
@@ -2779,8 +3105,9 @@ void UserApp_AppInit(void)
 
     /* 音频:ES8311 挂在同一条 I2C 总线上,所以必须在 Sensors_Init 之后 */
     if (Audio_Init() == ESP_OK && Audio_Open() == ESP_OK) {
-        Audio_SetVolume(70);
-        ESP_LOGI(TAG, "音频就绪,按 BOOT 键可暂停/继续音乐");
+        Audio_SetVolume(100);   /* 顶格。以前是 70,那只对应 -15dB,白少了 15dB */
+        ESP_LOGI(TAG, "音频就绪,音量 %d/100,按 BOOT 键可暂停/继续音乐",
+                 Audio_GetVolume());
     } else {
         ESP_LOGW(TAG, "音频初始化失败(喇叭不会有声音)");
     }
@@ -2988,7 +3315,7 @@ void UserApp_TaskInit(void)
     ESP_LOGI(TAG, "资源柱 %s: 柱 %dx%d @ y=%d, 五根 x=%d/%d/%d/%d/%d",
              RESBAR_TAG, VBAR_W, VBAR_H, VBAR_Y,
              s_col_x[0], s_col_x[1], s_col_x[2], s_col_x[3], s_col_x[4]);
-    ESP_LOGI(TAG, "网速满刻度: 下行 %d KiB/s (2.5G 内网) / 上行 %d KiB/s (宽带套餐), 单位自适应 KB/s↔MB/s",
+    ESP_LOGI(TAG, "网速满刻度: 下行 %d KiB/s (2.5G 内网) / 上行 %d KiB/s (宽带套餐)",
              NET_FULL_DN_KBPS, NET_FULL_UP_KBPS);
 
     /* 曲线页:短按 KEY 循环 时钟 -> 音乐 -> 曲线 */
@@ -3022,8 +3349,19 @@ void UserApp_TaskInit(void)
         ESP_LOGW(TAG, "蓝牙初始化失败,手机遥控不可用");
     }
 
+    /* BLE 网关第一版:只扫、只打日志。
+       目的是量“扫描开起来之后 WiFi 推流还稳不稳”,
+       所以这一版不显示、也不解析具体传感器的格式。 */
+    BleGate_SetBusyCallback(BleGateBusy);
+    if (BleGate_Start() != ESP_OK) {
+        ESP_LOGW(TAG, "BLE 网关启动失败(扫描不可用)");
+    }
+
     /* 网络音频:等电脑连过来推流(tools/stream_audio.py) */
     NetAudio_SetWantCallback(WantPcAudio);   /* 先注册,再起任务 */
+    /* USB(Type-C)建流时 net_audio 会把喇叭拿走,这里负责让界面跟上 ——
+       源、频谱开关、屏幕上的来源字都跟着切到"电脑推流"。 */
+    NetAudio_SetTakeCallback(TakePcAudio);
     NetAudio_Start();
     Sysmon_Start();          /* PC 资源遥测:监听 3334 */
 

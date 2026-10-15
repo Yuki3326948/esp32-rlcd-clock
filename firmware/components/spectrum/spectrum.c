@@ -6,6 +6,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 
 #include "dsps_fft2r.h"
 
@@ -63,9 +64,24 @@ static void *PsramAlloc(size_t bytes)
                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     return p;
 }
-static int   s_lo[SPECTRUM_BANDS];
-static int   s_hi[SPECTRUM_BANDS];
-static float s_band[SPECTRUM_BANDS];
+EXT_RAM_BSS_ATTR static int   s_lo[SPECTRUM_BANDS];
+EXT_RAM_BSS_ATTR static int   s_hi[SPECTRUM_BANDS];
+EXT_RAM_BSS_ATTR static float s_band[SPECTRUM_BANDS];
+
+/* 逐段"噪底"估计 —— 每个频段见过的【最低】电平,再以一个很慢的速度往上放。
+   实测背景(2026-10):麦克风那路在安静房间里整条低频段都会顶出 5~10% 的假柱,
+   用户报的就是"50-500Hz 有噪音"。
+   先查清了它【不是】什么:94~140Hz 反而是整条谱最干净的(0.003),隆起在
+   230~500Hz,是宽带噪声(MEMS 麦克风固有 + 环境),不是 50Hz 电源哼声 ——
+   所以【不能用滤波器】解决:滤波会把真声音一起砍掉,而且宽带噪底滤不干净。
+   改成把噪底估出来直接减掉:跟着环境走,不用手工标定,换个房间自动适应。
+
+   ★ 上升必须极慢(NF_RISE),下降必须立刻 —— 这样它收敛到"最低电平",
+     也就是噪底。一段持续的音会被慢慢淡出,对看音乐/说话没影响,
+     但拿它当频谱仪盯单音持续音时要注意。 */
+#define NF_RISE   0.0008f             /* ≈1250 帧 ≈53 秒升到头 */
+#define NF_MAX    0.85f               /* 噪底上限:再高就减不动了 */
+EXT_RAM_BSS_ATTR static float s_nf[SPECTRUM_BANDS];
 static float s_level = 0.0f;
 static int   s_fill  = 0;
 static bool  s_inited = false;
@@ -166,6 +182,21 @@ static void RunFft(void)
         float lv  = (db - s_floor) / (0.0f - s_floor);
         if (lv < 0.0f) lv = 0.0f;
         if (lv > 1.0f) lv = 1.0f;
+
+        /* ---- 逐段自适应噪底扣除(见 s_nf 上面的说明)----
+           低了立刻跟下去,高了极慢地放上来,于是 s_nf 收敛到该段的最低电平。
+           注意【先减噪底再平滑】:反过来的话,跌落那条曲线会把噪底也拖上去,
+           柱子尾部会拖出一条假尾巴。
+           减完要按 (1-nf) 重新归一化 —— 只减不缩的话这段永远到不了满格。*/
+        if (lv < s_nf[b]) {
+            s_nf[b] = lv;
+        } else if (s_nf[b] < NF_MAX) {
+            s_nf[b] += (lv - s_nf[b]) * NF_RISE;
+            if (s_nf[b] > NF_MAX) s_nf[b] = NF_MAX;
+        }
+        float lv2 = (lv - s_nf[b]) / (1.0f - s_nf[b]);
+        if (lv2 < 0.0f) lv2 = 0.0f;
+        lv = lv2;
 
         /* 上升要快(跟得上鼓点),下落要慢(看着舒服) */
         if (lv > s_band[b]) {
@@ -316,6 +347,7 @@ void Spectrum_Enable(bool on)
     s_enabled = on;
     if (!on) {
         memset(s_band, 0, sizeof(s_band));
+        memset(s_nf, 0, sizeof(s_nf));
         s_level = 0.0f;
         s_fill  = 0;
         s_hp_x1 = 0.0f;

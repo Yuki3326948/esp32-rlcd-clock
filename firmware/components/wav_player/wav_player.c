@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 
 #include "esp_log.h"
+#include "esp_attr.h"
 
 static const char *TAG = "wav";
 
@@ -18,10 +19,10 @@ static uint32_t     s_left     = 0;    /* 还剩多少 PCM 字节没读 */
 static char         s_path[WAV_PATH_LEN] = {0};
 
 /* 单声道转双声道时的中转缓冲。放静态区,别压在任务栈上。 */
-static uint8_t      s_tmp[4096];
+EXT_RAM_BSS_ATTR static uint8_t s_tmp[4096];
 
 /* ---- 扫描结果 ---- */
-static char s_files[WAV_MAX_FILES][WAV_PATH_LEN];
+EXT_RAM_BSS_ATTR static char s_files[WAV_MAX_FILES][WAV_PATH_LEN];
 static int  s_file_cnt = 0;
 
 static uint32_t RdU32(const uint8_t *p)

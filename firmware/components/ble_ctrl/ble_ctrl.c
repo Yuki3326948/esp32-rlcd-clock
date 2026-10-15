@@ -165,12 +165,28 @@ static void AdvStart(void)
     adv.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
+    /* ★ 广播间隔必须【显式】给,留 0 不是“随便”而是“最快”。
+       留 0 时 NimBLE 走到 ble_gap.c 的 ble_gap_adv_params_tx():
+           ble_gap_adv_dflt_itvls(conn_mode, &min, &max);
+       而 CONN_MODE_UND 对应 ble_gap.h 里的
+           BLE_GAP_ADV_FAST_INTERVAL1_MIN/MAX = 30ms / 60ms
+       —— 广播的最快档。对一个“手机上偶尔点一下播放/暂停”的遥控,
+       这纯属白烧射频:而本项目已经吃过 coex 的亏
+       (wifi:Coexist!!! Wi-Fi station would only keep waked when available)。
+       300/375ms 手机照样一下就搜到,射频事件率降 10 倍。
+       单位 0.625ms:0x01E0 = 480 × 0.625 = 300ms。 */
+    adv.itvl_min = 0x01E0;   /* 300ms */
+    adv.itvl_max = 0x0258;   /* 375ms */
+
     rc = ble_gap_adv_start(s_addr_type, NULL, BLE_HS_FOREVER, &adv,
                            GapEvent, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "开始广播失败: %d", rc);
     } else {
-        ESP_LOGI(TAG, "开始广播,设备名 \"%s\"", DEV_NAME);
+        /* 把生效的间隔打出来 —— 这样"改没改到"是看得见的,
+           不用去猜 NimBLE 到底用了默认值还是我们给的。单位 0.625ms。 */
+        ESP_LOGI(TAG, "开始广播,设备名 \"%s\",间隔 %.0f~%.0fms",
+                 DEV_NAME, adv.itvl_min * 0.625f, adv.itvl_max * 0.625f);
     }
 }
 

@@ -68,6 +68,19 @@ bool NetAudio_SetYield(bool yield_it);
    用回调是为了不让 net_audio 反过来依赖界面模块。 */
 void NetAudio_SetWantCallback(bool (*fn)(void));
 
+/* ★ 和上面那个正好相反:net_audio 【主动通知界面】"我把喇叭接管了,
+   把源也切到电脑推流吧"。
+
+   为什么 USB 这条要自动接管、而 WiFi 那条要先问:
+     1. 运行 wascap --usb 是用户明确的动作("我要听电脑");WiFi 那条的
+        电脑程序可能是一直挂在后台的,不该乱抢。
+     2. 更要紧的是:切源那个选择是【易失】的 —— 板子一复位就回到默认的
+        "播放音乐",而复位用户完全看不出来(重新烧录、断电、用某些串口
+        工具开一次口把 DTR/RTS 抖一下)。现象就是"我明明切到电脑推流了,
+        却一声不响",查都没法查。
+   必须通知界面,否则会出现"屏幕写着来自本地、耳朵里是电脑的声音"。*/
+void NetAudio_SetTakeCallback(void (*fn)(void));
+
 /* 正在推流的电脑 IP,没连返回空串 */
 const char *NetAudio_GetPeerIp(void);
 

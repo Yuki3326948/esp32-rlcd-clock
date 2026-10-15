@@ -25,6 +25,9 @@ __pycache__/
 build_exe/
 dist/
 *.spec
+# 编译出来的可执行文件不进库 —— 它们由 build.bat / pc_monitor.spec 生成,
+# 体积大而且随平台变。发行版里单独提供(见 Releases)。
+*.exe
 node_modules/
 
 # ============================================================

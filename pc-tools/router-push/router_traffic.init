@@ -1,0 +1,40 @@
+#!/bin/sh /etc/rc.common
+#
+# /etc/init.d/router_traffic —— procd 服务包装,负责开机自启 + 崩溃自动重启。
+#
+# 安装:
+#   scp 本文件到 /etc/init.d/router_traffic
+#   chmod +x /etc/init.d/router_traffic
+#   /etc/init.d/router_traffic enable
+#   /etc/init.d/router_traffic start
+#
+# 脚本本体在 /usr/bin/router_traffic.sh,用 /bin/sh 显式调用,
+# 所以那个文件不需要可执行位。
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/router_traffic.sh
+
+start_service() {
+	[ -f "$PROG" ] || {
+		echo "router_traffic: 找不到 $PROG"
+		return 1
+	}
+
+	procd_open_instance
+	procd_set_param command /bin/sh "$PROG"
+	# 一小时之内挂超过 5 次就放弃重启(防止脚本自身有 bug 时无限重启风暴)
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	# 让 nc 和脚本一起退;procd 会把整个进程组收掉,
+	# 这里只做一次明确的收尾,避免管道里残留 nc。
+	killall -q router_traffic.sh 2>/dev/null
+	return 0
+}
